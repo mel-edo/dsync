@@ -2,14 +2,14 @@ use std::{path::PathBuf, time::SystemTime};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-enum EventOp {
+pub enum EventOp {
     Create,
     Modify,
     Delete
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct FileEvent {
+pub struct FileEvent {
     operation: EventOp,
     file_path: PathBuf,
     hash: Option<String>,
