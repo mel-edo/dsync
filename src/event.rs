@@ -16,6 +16,27 @@ pub struct FileEvent {
     timestamp: SystemTime
 }
 
+impl FileEvent {
+    pub fn new(operation: EventOp, file_path: PathBuf, hash: Option<String>) -> Self {
+        Self {
+            operation,
+            file_path,
+            hash,
+            timestamp: SystemTime::now(),
+        }
+    }
+
+    pub fn file_path(&self) -> &PathBuf {
+        &self.file_path
+    }
+    pub fn operation(&self) -> &EventOp {
+        &self.operation
+    }
+    pub fn hash(&self) -> Option<&String> {
+        self.hash.as_ref()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

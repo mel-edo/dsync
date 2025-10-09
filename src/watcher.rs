@@ -17,22 +17,31 @@ pub async fn watch_folder(path: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
             match res {
 
                 Ok(event) => {
-                    match event.kind {
-                        notify::EventKind::Create(_) => {},
-                        notify::EventKind::Modify(notify::event::ModifyKind::Data(_)) => {},
-                        notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => {},
-                        notify::EventKind::Remove(_) => {},
-                        _ => {},
-                    }
+                    let operation = match event.kind {
+                        notify::EventKind::Create(_) => {EventOp::Create},
+                        notify::EventKind::Modify(notify::event::ModifyKind::Data(_)) => {EventOp::Modify},
+                        notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => {EventOp::Modify},
+                        notify::EventKind::Remove(_) => {EventOp::Delete},
+                        _ => {return;},
+                    };
 
-                    println!("Got event: {:?}", event);
+                    // println!("Got event: {:?}", event);
                     let tx2 = tx.clone();
 
+                    if event.paths.is_empty() {
+                        return;
+                    }
+
+                    let file_event = if operation == EventOp::Delete {
+                        FileEvent::new(operation, event.paths[0].clone(), None)
+                    } else {
+                        FileEvent::new(operation, event.paths[0].clone(),hash_file(&event.paths[0]))
+                    };
+
                     handle.spawn(async move {
-                        // later map 'event' -> file event and send it
-                        // loggging for now
-                        println!("Would send event via channel: {:?}", event);
-                        // tx2.send(my_file_event).await.unwrap();
+                        if let Err(e) = tx2.send(file_event).await {
+                            eprintln!("Channel send error: {:?}", e);
+                        }
                     });
 
                 },
@@ -44,4 +53,8 @@ pub async fn watch_folder(path: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
     file_watcher.watch(&path, RecursiveMode::Recursive)?;
 
     Ok(file_watcher)
+}
+
+fn hash_file(path: &PathBuf) -> Option<String> {
+    std::fs::read(path).ok().map(|data| blake3::hash(&data).to_hex().to_string())
 }
