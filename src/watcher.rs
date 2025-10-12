@@ -1,16 +1,20 @@
-use std::{path::PathBuf, time::SystemTime};
+use std::path::PathBuf;
+use pathdiff::diff_paths;
 use tokio::sync::mpsc;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher, Error};
 use crate::event::{FileEvent, EventOp};
 use blake3;
 
-pub async fn watch_folder(path: PathBuf, sender: mpsc::Sender<FileEvent>) -> notify::Result<RecommendedWatcher> {
+pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> notify::Result<RecommendedWatcher> {
 
     let tx = sender.clone();
     let handle = tokio::runtime::Handle::current();
 
+    let root_for_watcher = root.clone();
+
     let mut file_watcher = RecommendedWatcher::new(
         move |res: Result<Event, Error>| {
+            let root = root_for_watcher.clone();
 
             let handle = handle.clone();
 
@@ -32,10 +36,23 @@ pub async fn watch_folder(path: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
                         return;
                     }
 
+                    let absolute_path = &event.paths[0];
+                    let relative_path = diff_paths(absolute_path, &root)
+                        .unwrap_or_else(|| absolute_path.clone());
+
                     let file_event = if operation == EventOp::Delete {
-                        FileEvent::new(operation, event.paths[0].clone(), None)
+                        FileEvent::new(operation, relative_path, None, None)
                     } else {
-                        FileEvent::new(operation, event.paths[0].clone(),hash_file(&event.paths[0]))
+                        match std::fs::read(absolute_path) {
+                            Ok(bytes) => {
+                                let hash = blake3::hash(&bytes).to_hex().to_string();
+                                FileEvent::new(operation, relative_path, Some(hash), Some(bytes))
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to read file {:?}: {:?}", absolute_path, e);
+                                return;
+                            }
+                        }
                     };
 
                     handle.spawn(async move {
@@ -50,11 +67,7 @@ pub async fn watch_folder(path: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
 
         }, Config::default())?;
 
-    file_watcher.watch(&path, RecursiveMode::Recursive)?;
+    file_watcher.watch(root.as_path(), RecursiveMode::Recursive)?;
 
     Ok(file_watcher)
-}
-
-fn hash_file(path: &PathBuf) -> Option<String> {
-    std::fs::read(path).ok().map(|data| blake3::hash(&data).to_hex().to_string())
 }
