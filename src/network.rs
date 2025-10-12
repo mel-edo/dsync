@@ -1,9 +1,11 @@
+use std::{fs::{create_dir_all, metadata, remove_file, write}, path::{PathBuf}};
+
 use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::{TcpListener, TcpStream}, sync::mpsc};
 
-use crate::event::FileEvent;
+use crate::event::{EventOp, FileEvent};
 
 
-pub async fn start_server(port: u16, sender: mpsc::Sender<FileEvent>) -> anyhow::Result<()> {
+pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEvent>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
 
     println!("Server listening on port {}", port);
@@ -14,6 +16,7 @@ pub async fn start_server(port: u16, sender: mpsc::Sender<FileEvent>) -> anyhow:
         // spawn a new task with tokio::spawn to handle multiple peers
 
         let tx = sender.clone();
+        let root_clone = root.clone();
 
         tokio::spawn(async move {
             let mut reader = BufReader::new(stream);
@@ -35,6 +38,52 @@ pub async fn start_server(port: u16, sender: mpsc::Sender<FileEvent>) -> anyhow:
 
                 match bincode::deserialize::<FileEvent>(&buffer) {
                     Ok(event) => {
+                        match event.operation() {
+                            EventOp::Create | EventOp::Modify => {
+                                if let Some(bytes) = event.data().clone() {
+                                    let mut full_path = root_clone.clone();
+                                    full_path.push(event.file_path());
+
+                                    // check if parent directory exists or not and create it if it doesen't
+                                    if let Some(parent) = full_path.parent() {
+                                        if let Err(e) = create_dir_all(parent) {
+                                            eprintln!("Failed to create parent directories for {:?} with error {:?}", full_path, e);
+                                            continue;
+                                        }
+                                    }
+                                    // check last write
+                                    let should_write = match metadata(&full_path) {
+                                        Ok(meta) => {
+                                            if let Ok(modified) = meta.modified() {
+                                                modified < *event.timestamp()
+                                            } else { true }
+                                        }
+                                        Err(_) => true, // file doesen't exist
+                                    };
+
+                                    if should_write {
+                                        if let Err(e) = write(&full_path, &bytes) {
+                                            eprintln!("Failed to write file {:?}: {:?}", full_path, e);
+                                        } else {
+                                            println!("File written: {:?}", full_path);
+                                        }
+                                    } else {
+                                        println!("Skipped {:?}, local file is newer.", full_path);
+                                    }
+                                }
+                            }
+                            EventOp::Delete => {
+                                let mut full_path = root_clone.clone();
+                                full_path.push(event.file_path());
+                                if full_path.exists() {
+                                    if let Err(e) = remove_file(&full_path) {
+                                        eprintln!("Failed to delete file {:?}: {:?}", full_path, e);
+                                    } else {
+                                        println!("File deleted: {:?}", full_path);
+                                    }
+                                }
+                            }
+                        }
                         if let Err(e) = tx.send(event).await {
                             eprintln!("Channel send error: {:?}", e);
                             break;
