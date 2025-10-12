@@ -41,9 +41,15 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                         match event.operation() {
                             EventOp::Create | EventOp::Modify => {
                                 if let Some(bytes) = event.data().clone() {
+                                    let rel_path = event.file_path();
                                     let mut full_path = root_clone.clone();
-                                    full_path.push(event.file_path());
 
+                                    // removing absolute path components
+                                    if let Ok(clean_rel_path) = rel_path.strip_prefix("/") {
+                                        full_path.push(clean_rel_path);
+                                    } else {
+                                        full_path.push(rel_path);
+                                    }
                                     // check if parent directory exists or not and create it if it doesen't
                                     if let Some(parent) = full_path.parent() {
                                         if let Err(e) = create_dir_all(parent) {
