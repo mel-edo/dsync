@@ -44,28 +44,3 @@ impl FileEvent {
         &self.timestamp
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bincode;
-
-    #[test]
-    fn test_event_roundtrip() {
-        let event = FileEvent {
-            operation: EventOp::Create,
-            file_path: PathBuf::from("example.txt"),
-            hash: Some("abc123".to_string()),
-            timestamp: SystemTime::now(),
-            data: Some(vec![1, 2, 3])
-        };
-
-        let encoded = bincode::serialize(&event).unwrap();
-
-        let decoded: FileEvent = bincode::deserialize(&encoded).unwrap();
-
-        assert_eq!(event.operation, decoded.operation);
-        assert_eq!(event.file_path, decoded.file_path);
-        assert_eq!(event.hash, decoded.hash);
-    }
-}

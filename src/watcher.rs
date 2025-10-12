@@ -37,8 +37,13 @@ pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
                     }
 
                     let absolute_path = &event.paths[0];
-                    let relative_path = diff_paths(absolute_path, &root)
-                        .unwrap_or_else(|| absolute_path.clone());
+                    let relative_path = match diff_paths(absolute_path, &root) {
+                        Some(p) => p,
+                        None => {
+                            eprintln!("Could not compute relative path for {:?}", absolute_path);
+                            return;
+                        }
+                    };
 
                     let file_event = if operation == EventOp::Delete {
                         FileEvent::new(operation, relative_path, None, None)
