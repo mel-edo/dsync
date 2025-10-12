@@ -13,16 +13,18 @@ pub struct FileEvent {
     operation: EventOp,
     file_path: PathBuf,
     hash: Option<String>,
-    timestamp: SystemTime
+    timestamp: SystemTime,
+    data: Option<Vec<u8>>
 }
 
 impl FileEvent {
-    pub fn new(operation: EventOp, file_path: PathBuf, hash: Option<String>) -> Self {
+    pub fn new(operation: EventOp, file_path: PathBuf, hash: Option<String>, data: Option<Vec<u8>>) -> Self {
         Self {
             operation,
             file_path,
             hash,
             timestamp: SystemTime::now(),
+            data
         }
     }
 
@@ -32,8 +34,14 @@ impl FileEvent {
     pub fn operation(&self) -> &EventOp {
         &self.operation
     }
-    pub fn hash(&self) -> Option<&String> {
-        self.hash.as_ref()
+    // pub fn hash(&self) -> Option<&String> {
+        // self.hash.as_ref()
+    // }
+    pub fn data(&self) -> &Option<Vec<u8>> {
+        &self.data
+    }
+    pub fn timestamp(&self) -> &SystemTime {
+        &self.timestamp
     }
 }
 
@@ -49,6 +57,7 @@ mod tests {
             file_path: PathBuf::from("example.txt"),
             hash: Some("abc123".to_string()),
             timestamp: SystemTime::now(),
+            data: Some(vec![1, 2, 3])
         };
 
         let encoded = bincode::serialize(&event).unwrap();
