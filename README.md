@@ -1,7 +1,5 @@
 # dsync - A cross platform LAN file synchronization tool
 
----
-
 ## Goal
 
 Building a lightweight, rust based daemon that allows for real time file synchronization over LAN across multiple devices without cloud or centralized servers, ensuring fast and private folder mirroring.
@@ -15,8 +13,6 @@ Building a lightweight, rust based daemon that allows for real time file synchro
 - Decentralized → no single server, all peers participate equally.
 
 - Privacy-focused → stays entirely within the local network.
-
----
 
 ## Installation
 
@@ -43,7 +39,6 @@ cargo build --release
 ```bash
 cp target/release/dsync ~/.local/bin/
 ```
----
 
 ## Usage
 
