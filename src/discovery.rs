@@ -2,6 +2,7 @@ use mdns_sd::{ServiceDaemon, ServiceInfo, ServiceEvent};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use get_if_addrs::{get_if_addrs, IfAddr};
 
 const SERVICE_TYPE: &str = "_dsync._tcp.local.";
 
@@ -26,11 +27,28 @@ impl PeerDiscovery {
             .into_string()
             .unwrap_or_else(|_| "dsync-node".to_string());
 
+        // ensure hostname ends with .local
+        let hostname = if hostname.ends_with(".local.") {
+            hostname
+        } else if hostname.ends_with(".local") {
+            format!("{}.", hostname)
+        } else {
+            format!("{}.local.", hostname)
+        };
+
+        let host_addr = get_if_addrs()?
+            .into_iter()
+            .find_map(|iface| match iface.addr {
+                IfAddr::V4(v4) if !v4.ip.is_loopback() => Some(v4.ip.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+
         let service_info = ServiceInfo::new(
             SERVICE_TYPE,
             instance_name,
             &hostname,
-            "",
+            &host_addr,
             port,
             None,
         )?;
