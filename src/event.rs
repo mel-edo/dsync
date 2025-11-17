@@ -14,7 +14,8 @@ pub struct FileEvent {
     file_path: PathBuf,
     hash: Option<String>,
     timestamp: SystemTime,
-    data: Option<Vec<u8>>
+    data: Option<Vec<u8>>,
+    origin_id: Option<String>,
 }
 
 impl FileEvent {
@@ -24,7 +25,8 @@ impl FileEvent {
             file_path,
             hash,
             timestamp: SystemTime::now(),
-            data
+            data,
+            origin_id: None,
         }
     }
 
@@ -42,5 +44,12 @@ impl FileEvent {
     }
     pub fn timestamp(&self) -> &SystemTime {
         &self.timestamp
+    }
+    pub fn with_origin(mut self, origin_id: String) -> Self {
+        self.origin_id = Some(origin_id);
+        self
+    }
+    pub fn origin_id(&self) -> Option<&String> {
+        self.origin_id.as_ref()
     }
 }

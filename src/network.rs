@@ -5,7 +5,7 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::{TcpListener, Tcp
 use crate::event::{EventOp, FileEvent};
 
 
-pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEvent>) -> anyhow::Result<()> {
+pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEvent>, instance_id: String) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
 
     println!("Server listening on port {}", port);
@@ -17,6 +17,7 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
 
         let tx = sender.clone();
         let root_clone = root.clone();
+        let instance_id_clone = instance_id.clone();
 
         tokio::spawn(async move {
             let mut reader = BufReader::new(stream);
@@ -38,18 +39,22 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
 
                 match bincode::deserialize::<FileEvent>(&buffer) {
                     Ok(event) => {
+                        // skip events that originated from this instance
+                        if let Some(origin) = event.origin_id() {
+                            if origin == &instance_id_clone {
+                                println!("Skipping event from self (origin: {})", origin);
+                                continue;
+                            }
+                        }
                         match event.operation() {
                             EventOp::Create | EventOp::Modify => {
                                 if let Some(bytes) = event.data().clone() {
                                     let rel_path = event.file_path();
-                                    let mut full_path = root_clone.clone();
+                                    println!("Received relative path: {:?}", rel_path);
 
-                                    // removing absolute path components
-                                    if let Ok(clean_rel_path) = rel_path.strip_prefix("/") {
-                                        full_path.push(clean_rel_path);
-                                    } else {
-                                        full_path.push(rel_path);
-                                    }
+                                    let mut full_path = root_clone.clone();
+                                    full_path.push(rel_path);
+
                                     // check if parent directory exists or not and create it if it doesen't
                                     if let Some(parent) = full_path.parent() {
                                         if let Err(e) = create_dir_all(parent) {

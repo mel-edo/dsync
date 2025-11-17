@@ -37,7 +37,23 @@ pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
                     }
 
                     let absolute_path = &event.paths[0];
-                    let relative_path = match diff_paths(absolute_path, &root) {
+
+                    let canonical_root = match root.canonicalize() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("Failed to canonicalize root path {:?}: {:?}", root, e);
+                            return;
+                        }
+                    };
+
+                    let canonical_absolute = match absolute_path.canonicalize() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            absolute_path.clone()
+                        }
+                    };
+
+                    let relative_path = match diff_paths(&canonical_absolute, &canonical_root) {
                         Some(p) => p,
                         None => {
                             eprintln!("Could not compute relative path for {:?}", absolute_path);
