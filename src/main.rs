@@ -20,21 +20,23 @@ mod discovery;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    // Folder to sync
-    #[arg(short = 'd', long, default_value = "./test_folder")]
+    /// Folder path to sync
+    #[arg(short = 'd', long)]
     path: String,
 
-    // Port to listen on
+    /// Port to listen on for incoming connections
     #[arg(short = 'p', long, default_value_t = 9000)]
     port: u16,
 
-    // peer address
+    /// Peer address to connect to (format: ip:port)
     #[arg(short = 'a', long)]
     peer: Option<String>,
 
+    /// Unique name for this instance
     #[arg(short = 'n', long, default_value = "dsync-instance")]
     name: String,
 
+    /// Disable automatic peer discovery
     #[arg(long, default_value_t = false)]
     no_discovery: bool,
 }

@@ -18,6 +18,46 @@ Building a lightweight, rust based daemon that allows for real time file synchro
 
 ---
 
+## Installation
+
+### Prerequisites
+
+- [Rust toolchain](https://rustup.rs/)
+
+### Build from Source
+
+1. Clone the repository:
+```bash
+git clone https://github.com/mel-edo/dsync.git
+cd dsync
+```
+
+2. Build release binary:
+```bash
+cargo build --release
+```
+
+3. Binary will be located at 'target/release/dsync'
+
+4. Add to local/bin
+```bash
+cp target/release/dsync ~/.local/bin/
+```
+---
+
+## Usage
+
+```bash
+dsync -d [file_path] -p [port_number] -n [machine_name]
+```
+
+Example:
+```bash
+dsync -d ~/test_folder -p 9000 -n machine1
+```
+
+---
+
 ### License
 
 Licensed under [GPL-3.0](LICENSE)
