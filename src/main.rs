@@ -11,6 +11,7 @@ mod network;
 mod sync;
 mod util;
 mod watcher;
+mod discovery;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -26,6 +27,12 @@ struct Args {
     // peer address
     #[arg(short = 'a', long)]
     peer: Option<String>,
+
+    #[arg(short = 'n', long, default_value = "dsync-instance")]
+    name: String,
+
+    #[arg(long, default_value_t = false)]
+    no_discovery: bool,
 }
 
 #[tokio::main]
@@ -35,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
     let folder_path = PathBuf::from(args.path);
     let port = args.port;
     let peer_addr = args.peer;
+    let instance_id = args.name.clone();
 
     let (tx, mut rx) = mpsc::channel(100);
     let _watcher = watch_folder(folder_path.clone(), tx.clone()).await?;
@@ -42,12 +50,23 @@ async fn main() -> anyhow::Result<()> {
     let last_hashes: Arc<Mutex<HashMap<PathBuf, Hash>>> = Arc::new(Mutex::new(HashMap::<PathBuf, Hash>::new()));
     let last_hashes_clone: Arc<Mutex<HashMap<PathBuf, Hash>>> = Arc::clone(&last_hashes);
 
+    // setup mdns discovery
+    let peer_discovery = if !args.no_discovery {
+        let discovery = discovery::PeerDiscovery::new()?;
+        discovery.register_service(port, &args.name)?;
+        discovery.start_browsing().await?;
+        Some(Arc::new(discovery))
+    } else {
+        None
+    };
+
     // start tcp server
     tokio::spawn({
         let tx_clone = tx.clone();
         let folder_clone = folder_path.clone();
+        let instance_id_clone = instance_id.clone();
         async move {
-            if let Err(e) = network::start_server(port, folder_clone, tx_clone).await {
+            if let Err(e) = network::start_server(port, folder_clone, tx_clone, instance_id_clone).await {
                 eprintln!("Server error: {:?}", e);
             }
         }
@@ -55,9 +74,13 @@ async fn main() -> anyhow::Result<()> {
 
     // forward events to peers
     tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
+        while let Some(mut event) = rx.recv().await {
+            if event.origin_id().is_some() {
+                println!("Skipping forwarding of received event from peer");
+                continue;
+            }
+            
             println!("Got FileEvent in main: {:?}", event);
-
             // don't forward loopback events
             // if event.file_path().starts_with(&folder_path) {
                 // println!("Skipping loopback events {:?}", event.file_path());
@@ -82,14 +105,32 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             map.insert(event.file_path().clone(), hash);
+            
+            // adding orgin id to prevent loops
+            event = event.with_origin(instance_id.clone());
 
+            // get peers to send to
+            let mut peers = Vec::new();
             if let Some(ref peer) = peer_addr {
-                if let Err(e) = network::send_event(peer, event).await {
-                    eprintln!("Failed to send event: {:?}", e);
-                }
-            } else {
-                println!("No peer specified, skipping send");
+                peers.push(peer.clone());
             }
+            if let Some(ref discovery) = peer_discovery {
+                peers.extend(discovery.get_peers().await);
+            }
+
+            for peer in peers {
+                if let Err(e) = network::send_event(&peer, event.clone()).await {
+                    eprintln!("Failed to send event to {}: {:?}", peer, e);
+                }
+            }
+
+            // if let Some(ref peer) = peer_addr {
+            //     if let Err(e) = network::send_event(peer, event).await {
+            //         eprintln!("Failed to send event: {:?}", e);
+            //     }
+            // } else {
+            //     println!("No peer specified, skipping send");
+            // }
         }
     });
 

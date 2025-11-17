@@ -12,3 +12,5 @@ serde = { version = "1.0.219", features = ["derive"] }
 anyhow = "1.0.99"
 clap = { version = "4.5.48", features = ["derive"] }
 pathdiff = "0.2.3"
+mdns-sd = "0.11"
+hostname = "0.4"
