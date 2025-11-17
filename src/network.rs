@@ -1,6 +1,8 @@
-use std::{fs::{create_dir_all, metadata, remove_file, write}, path::{PathBuf}};
+use std::{collections::HashMap, fs::{create_dir_all, metadata, remove_file, write}, path::{PathBuf}};
 
-use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::{TcpListener, TcpStream}, sync::mpsc};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::{TcpListener, TcpStream}, sync::{mpsc, Mutex}};
+
+use anyhow::Context;
 
 use crate::event::{EventOp, FileEvent};
 
@@ -114,13 +116,51 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
     //Ok(())
 }
 
-pub async fn send_event(addr: &str, event: FileEvent) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stream = TcpStream::connect(addr).await?;
-    let serialized = bincode::serialize(&event)?;
+pub struct ConnectionPool {
+    streams: Mutex<HashMap<String, TcpStream>>,
+}
 
-    let len = serialized.len() as u32;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&serialized).await?;
+impl ConnectionPool {
+    pub fn new() -> Self {
+        Self {
+            streams: Mutex::new(HashMap::new()),
+        }
+    }
 
-    Ok(())
+    pub async fn send_event(&self, addr: &str, event: &FileEvent) -> anyhow::Result<()> {
+        let mut stream = self.acquire_stream(addr).await?;
+        let serialized = bincode::serialize(event)?;
+        let len = serialized.len() as u32;
+
+        stream
+            .write_all(&len.to_be_bytes())
+            .await
+            .with_context(|| format!("failed to send length to {addr}"))?;
+
+        stream
+            .write_all(&serialized)
+            .await
+            .with_context(|| format!("failed to send payload to {addr}"))?;
+
+        self.store_stream(addr, stream).await;
+        Ok(())
+    }
+
+    async fn acquire_stream(&self, addr: &str) -> anyhow::Result<TcpStream> {
+        if let Some(stream) = {
+            let mut guard = self.streams.lock().await;
+            guard.remove(addr)
+        } {
+            return Ok(stream);
+        }
+
+        TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("failed to connect to {addr}"))
+    }
+
+    async fn store_stream(&self, addr: &str, stream: TcpStream) {
+        let mut guard = self.streams.lock().await;
+        guard.insert(addr.to_string(), stream);
+    }
 }

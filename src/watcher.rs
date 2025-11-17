@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+use std::{io::ErrorKind, path::PathBuf};
 use pathdiff::diff_paths;
-use tokio::sync::mpsc;
+use tokio::{fs, sync::mpsc};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher, Error};
 use crate::event::{FileEvent, EventOp};
 use blake3;
@@ -30,8 +30,6 @@ pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
                     };
 
                     // println!("Got event: {:?}", event);
-                    let tx2 = tx.clone();
-
                     if event.paths.is_empty() {
                         return;
                     }
@@ -61,22 +59,29 @@ pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
                         }
                     };
 
-                    let file_event = if operation == EventOp::Delete {
-                        FileEvent::new(operation, relative_path, None, None)
-                    } else {
-                        match std::fs::read(absolute_path) {
-                            Ok(bytes) => {
-                                let hash = blake3::hash(&bytes).to_hex().to_string();
-                                FileEvent::new(operation, relative_path, Some(hash), Some(bytes))
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to read file {:?}: {:?}", absolute_path, e);
-                                return;
-                            }
-                        }
-                    };
+                    let tx2 = tx.clone();
+                    let rel_path = relative_path.clone();
+                    let abs_path = canonical_absolute.clone();
+                    let op = operation.clone();
 
                     handle.spawn(async move {
+                        let file_event = match op {
+                            EventOp::Delete => FileEvent::new(EventOp::Delete, rel_path.clone(), None, None),
+                            _ => match fs::read(&abs_path).await {
+                                Ok(bytes) => {
+                                    let hash = blake3::hash(&bytes).to_hex().to_string();
+                                    FileEvent::new(op, rel_path.clone(), Some(hash), Some(bytes))
+                                }
+                                Err(err) if err.kind() == ErrorKind::NotFound => {
+                                    FileEvent::new(EventOp::Delete, rel_path.clone(), None, None)
+                                }
+                                Err(err) => {
+                                    eprintln!("Failed to read file {:?}: {:?}", abs_path, err);
+                                    return;
+                                }
+                            },
+                        };
+
                         if let Err(e) = tx2.send(file_event).await {
                             eprintln!("Channel send error: {:?}", e);
                         }

@@ -4,7 +4,11 @@ use clap::Parser;
 use blake3::Hash;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::watcher::watch_folder;
+use crate::{
+    event::EventOp,
+    network::ConnectionPool,
+    watcher::watch_folder,
+};
 
 mod event;
 mod network;
@@ -49,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
 
     let last_hashes: Arc<Mutex<HashMap<PathBuf, Hash>>> = Arc::new(Mutex::new(HashMap::<PathBuf, Hash>::new()));
     let last_hashes_clone: Arc<Mutex<HashMap<PathBuf, Hash>>> = Arc::clone(&last_hashes);
+    let connection_pool = Arc::new(ConnectionPool::new());
 
     // setup mdns discovery
     let peer_discovery = if !args.no_discovery {
@@ -74,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
 
     // forward events to peers
     tokio::spawn(async move {
+        let connection_pool = Arc::clone(&connection_pool);
         while let Some(mut event) = rx.recv().await {
             if event.origin_id().is_some() {
                 println!("Skipping forwarding of received event from peer");
@@ -87,24 +93,30 @@ async fn main() -> anyhow::Result<()> {
                 // continue;
             // }
 
-            let abs_path = folder_path.join(event.file_path());
-            let hash = match read(&abs_path) {
-                Ok(contents) => blake3::hash(&contents),
-                Err(_) => {
-                    // file may be deleted for which we would have to delete it
-                    let mut map = last_hashes_clone.lock().await;
-                    map.remove(event.file_path().as_path());
-                    continue;
+            let current_hash = if matches!(event.operation(), EventOp::Delete) {
+                None
+            } else {
+                let abs_path = folder_path.join(event.file_path());
+                match read(&abs_path) {
+                    Ok(contents) => Some(blake3::hash(&contents)),
+                    Err(_) => None,
                 }
             };
 
             let mut map = last_hashes_clone.lock().await;
-            if let Some(prev_hash) = map.get(event.file_path().as_path()) {
-                if *prev_hash == hash {
-                    continue;
+            match current_hash {
+                Some(hash) => {
+                    if let Some(prev_hash) = map.get(event.file_path().as_path()) {
+                        if *prev_hash == hash {
+                            continue;
+                        }
+                    }
+                    map.insert(event.file_path().clone(), hash);
+                }
+                None => {
+                    map.remove(event.file_path().as_path());
                 }
             }
-            map.insert(event.file_path().clone(), hash);
             
             // adding orgin id to prevent loops
             event = event.with_origin(instance_id.clone());
@@ -119,8 +131,10 @@ async fn main() -> anyhow::Result<()> {
             }
 
             for peer in peers {
-                if let Err(e) = network::send_event(&peer, event.clone()).await {
+                if let Err(e) = connection_pool.send_event(&peer, &event).await {
                     eprintln!("Failed to send event to {}: {:?}", peer, e);
+                    // drop connection on failure so next attempt reconnects
+                    continue;
                 }
             }
 
