@@ -68,7 +68,8 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                     let should_write = match metadata(&full_path) {
                                         Ok(meta) => {
                                             if let Ok(modified) = meta.modified() {
-                                                modified < *event.timestamp()
+                                                // changing '<' to '<=' to accept updates happening in the same millisecond
+                                                modified <= *event.timestamp()
                                             } else { true }
                                         }
                                         Err(_) => true, // file doesen't exist

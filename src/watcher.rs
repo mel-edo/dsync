@@ -65,6 +65,10 @@ pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
                     let op = operation.clone();
 
                     handle.spawn(async move {
+
+                        // FIX: some files end up being 0 bytes so waiting 200ms
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
                         let file_event = match op {
                             EventOp::Delete => FileEvent::new(EventOp::Delete, rel_path.clone(), None, None),
                             _ => match fs::read(&abs_path).await {
