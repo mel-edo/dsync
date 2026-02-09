@@ -1,8 +1,9 @@
 use std::{collections::HashMap, fs::read, path::PathBuf, sync::Arc};
 use clap::Parser;
-
 use blake3::Hash;
 use tokio::sync::{mpsc, Mutex};
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
 
 use crate::{
     event::EventOp,
@@ -16,6 +17,7 @@ mod sync;
 mod util;
 mod watcher;
 mod discovery;
+pub mod protocol;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -45,6 +47,13 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    // generate ephemeral identity
+    let mut csprng = OsRng{};
+    let keypair = SigningKey::generate(&mut csprng);
+    let my_public_key = keypair.verifying_key().to_bytes();
+
+    println!("Ephemeral ID: {}", hex::encode(my_public_key));
+
     let folder_path = PathBuf::from(args.path);
     let port = args.port;
     let peer_addr = args.peer;
@@ -55,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
 
     let last_hashes: Arc<Mutex<HashMap<PathBuf, Hash>>> = Arc::new(Mutex::new(HashMap::<PathBuf, Hash>::new()));
     let last_hashes_clone: Arc<Mutex<HashMap<PathBuf, Hash>>> = Arc::clone(&last_hashes);
-    let connection_pool = Arc::new(ConnectionPool::new());
+    let connection_pool = Arc::new(ConnectionPool::new(keypair));
 
     // setup mdns discovery
     let peer_discovery = if !args.no_discovery {
@@ -84,7 +93,6 @@ async fn main() -> anyhow::Result<()> {
         let connection_pool = Arc::clone(&connection_pool);
         while let Some(mut event) = rx.recv().await {
             if event.origin_id().is_some() {
-                println!("Skipping forwarding of received event from peer");
                 continue;
             }
             
@@ -109,15 +117,11 @@ async fn main() -> anyhow::Result<()> {
             match current_hash {
                 Some(hash) => {
                     if let Some(prev_hash) = map.get(event.file_path().as_path()) {
-                        if *prev_hash == hash {
-                            continue;
-                        }
+                        if *prev_hash == hash { continue; }
                     }
                     map.insert(event.file_path().clone(), hash);
                 }
-                None => {
-                    map.remove(event.file_path().as_path());
-                }
+                None => { map.remove(event.file_path().as_path()); }
             }
             
             // adding orgin id to prevent loops
@@ -135,18 +139,8 @@ async fn main() -> anyhow::Result<()> {
             for peer in peers {
                 if let Err(e) = connection_pool.send_event(&peer, &event).await {
                     eprintln!("Failed to send event to {}: {:?}", peer, e);
-                    // drop connection on failure so next attempt reconnects
-                    continue;
                 }
             }
-
-            // if let Some(ref peer) = peer_addr {
-            //     if let Err(e) = network::send_event(peer, event).await {
-            //         eprintln!("Failed to send event: {:?}", e);
-            //     }
-            // } else {
-            //     println!("No peer specified, skipping send");
-            // }
         }
     });
 
