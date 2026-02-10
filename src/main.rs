@@ -137,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             for peer in peers {
-                if let Err(e) = connection_pool.send_event(&peer, &event).await {
+                if let Err(e) = connection_pool.send_event(&peer, &event, &folder_path).await {
                     eprintln!("Failed to send event to {}: {:?}", peer, e);
                 }
             }

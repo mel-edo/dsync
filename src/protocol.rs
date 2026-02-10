@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::event::{FileChunk, FileEvent};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum HandshakeMsg {
@@ -9,4 +10,10 @@ pub enum HandshakeMsg {
     },
     Ack,
     Reject,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TransferMsg {
+    Event(FileEvent),
+    Chunk(FileChunk),
 }
