@@ -92,7 +92,7 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                 if let Err(e) = fs::rename(&part_path, &full_path) {
                                     eprintln!("Failed to rename partial file: {:?}", e);
                                 } else {
-                                    println!("Download complete: {:?}", full_path);
+                                    println!("Received: {:?}", full_path);
 
                                     let event = FileEvent::new(
                                         EventOp::Create,
@@ -160,7 +160,7 @@ impl ConnectionPool {
 
                     offset += bytes_read as u64;
                 }
-                println!("Streamed file: {:?}", event.file_path());
+                println!("Sent: {:?}", event.file_path());
             }
         }
         self.store_stream(addr, stream).await;

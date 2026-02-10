@@ -52,7 +52,8 @@ async fn main() -> anyhow::Result<()> {
     let keypair = SigningKey::generate(&mut csprng);
     let my_public_key = keypair.verifying_key().to_bytes();
 
-    println!("Ephemeral ID: {}", hex::encode(my_public_key));
+    let my_id_hex = hex::encode(my_public_key);
+    println!("Ephemeral ID: {}", my_id_hex);
 
     let folder_path = PathBuf::from(args.path);
     let port = args.port;
@@ -68,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
 
     // setup mdns discovery
     let peer_discovery = if !args.no_discovery {
-        let discovery = discovery::PeerDiscovery::new()?;
+        let discovery = discovery::PeerDiscovery::new(my_id_hex)?;
         discovery.register_service(port, &args.name)?;
         discovery.start_browsing().await?;
         Some(Arc::new(discovery))
@@ -98,12 +99,12 @@ async fn main() -> anyhow::Result<()> {
                     let hash = blake3::hash(&contents);
                     let mut map = last_hashes_clone.lock().await;
                     map.insert(event.file_path().clone(), hash);
-                    println!("Synced remote file (updated hash): {:?}", event.file_path());
+                    println!("Received: {:?}", event.file_path());
                 }
                 continue;
             }
             
-            println!("Got FileEvent in main: {:?}", event);
+            // println!("Got FileEvent in main: {:?}", event);
 
             let current_hash = if matches!(event.operation(), EventOp::Delete) {
                 None
