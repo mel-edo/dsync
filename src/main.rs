@@ -93,15 +93,17 @@ async fn main() -> anyhow::Result<()> {
         let connection_pool = Arc::clone(&connection_pool);
         while let Some(mut event) = rx.recv().await {
             if event.origin_id().is_some() {
+                let abs_path = folder_path.join(event.file_path());
+                if let Ok(contents) = read(&abs_path) {
+                    let hash = blake3::hash(&contents);
+                    let mut map = last_hashes_clone.lock().await;
+                    map.insert(event.file_path().clone(), hash);
+                    println!("Synced remote file (updated hash): {:?}", event.file_path());
+                }
                 continue;
             }
             
             println!("Got FileEvent in main: {:?}", event);
-            // don't forward loopback events
-            // if event.file_path().starts_with(&folder_path) {
-                // println!("Skipping loopback events {:?}", event.file_path());
-                // continue;
-            // }
 
             let current_hash = if matches!(event.operation(), EventOp::Delete) {
                 None

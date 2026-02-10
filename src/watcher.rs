@@ -27,6 +27,11 @@ pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
                     if event.paths.is_empty() { return; }
                     let absolute_path = event.paths[0].clone();
 
+                    // ignore .part files
+                    if let Some(ext) = absolute_path.extension() {
+                        if ext == "part" { return; }
+                    }
+
                     // resolve paths
                     let canonical_root = match root.canonicalize() {
                         Ok(p) => p,

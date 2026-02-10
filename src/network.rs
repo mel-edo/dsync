@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::{self, OpenOptions, create_dir_all, metadata, remove_file}, io::{Read, Write}, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, fs::{self, OpenOptions, create_dir_all, remove_file}, io::{Read, Write}, path::PathBuf, sync::Arc};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::{TcpListener, TcpStream}, sync::{mpsc, Mutex}, time::{timeout, Duration}};
 use anyhow::{Context, bail};
 use crate::event::{EventOp, FileEvent, FileChunk};
@@ -59,6 +59,7 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                         let _ = remove_file(&full_path);
                                         println!("Deleted: {:?}", full_path);
                                     }
+                                    let _ = tx.send(event).await;
                                 }
                                 EventOp::Create | EventOp::Modify => {
                                     let full_path = root_clone.join(event.file_path());
@@ -66,42 +67,41 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                     if let Some(parent) = full_path.parent() {
                                         let _ = create_dir_all(parent);
                                     }
-
-                                    let should_write = match metadata(&full_path) {
-                                        Ok(meta) => {
-                                            if let Ok(modified) = meta.modified() {
-                                                modified <= *event.timestamp()
-                                            } else { true }
-                                        }
-                                        Err(_) => true,
-                                    };
-
-                                    if should_write {
-                                        if let Err(e) = fs::File::create(&full_path) {
-                                            eprintln!("Failed to create file {:?}: {:?}", full_path, e);
-                                        } else {
-                                            println!("Prepared file for sync: {:?}", full_path);
-                                        }
-                                    } else {
-                                        println!("Skipped {:?} (Local is newer)", full_path);
-                                    }
                                 }
                             }
-                            let _ = tx.send(event).await;
                         },
                         TransferMsg::Chunk(chunk) => {
                             let full_path = root_clone.join(&chunk.rel_path);
 
-                            let mut options = OpenOptions::new();
-                            options.write(true).append(true).create(false);
+                            let part_path = full_path.with_extension("part");
 
-                            match options.open(&full_path) {
+                            let mut options = OpenOptions::new();
+                            options.write(true).append(true).create(true);
+
+                            match options.open(&part_path) {
                                 Ok(mut file) => {
                                     if let Err(e) = file.write_all(&chunk.data) {
                                         eprintln!("Failed to write chunk: {:?}", e);
                                     }
                                 }
-                                Err(e) => eprintln!("Failed to append chunk to {:?}: {:?}", full_path, e),
+                                Err(e) => eprintln!("Failed to append chunk to {:?}: {:?}", part_path, e),
+                            }
+
+                            // on last chunk -> rename .part to real file
+                            if chunk.is_last {
+                                if let Err(e) = fs::rename(&part_path, &full_path) {
+                                    eprintln!("Failed to rename partial file: {:?}", e);
+                                } else {
+                                    println!("Download complete: {:?}", full_path);
+
+                                    let event = FileEvent::new(
+                                        EventOp::Create,
+                                        chunk.rel_path,
+                                        None
+                                    ).with_origin("network".to_string());
+
+                                    let _ = tx.send(event).await;
+                                }
                             }
                         }
                     },

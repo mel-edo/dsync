@@ -71,12 +71,19 @@ impl PeerDiscovery {
                         let addresses = info.get_addresses();
                         let port = info.get_port();
 
-                        if let Some(addr) = addresses.iter().next() {
-                            let peer_addr = format!("{}:{}", addr, port);
-                            println!("Discovered peer: {} at {}", instance_name, peer_addr);
+                        let peer_id = info.get_property("id")
+                            .map(|p| p.val_str())
+                            .unwrap_or("unknown");
 
-                            let mut peers_map = peers.lock().await;
-                            peers_map.insert(instance_name.clone(), peer_addr);
+                        for addr in addresses {
+                            if addr.is_ipv4() {
+                                let peer_addr = format!("{}:{}", addr, port);
+                                println!("Discovered peer: {} (ID: {}) at {}", instance_name, peer_id, peer_addr);
+
+                                let mut peers_map = peers.lock().await;
+                                peers_map.insert(instance_name.clone(), peer_addr);
+                                break;
+                            }
                         }
                     }
                     ServiceEvent::ServiceRemoved(_, fullname) => {
