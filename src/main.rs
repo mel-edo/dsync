@@ -26,7 +26,7 @@ struct Args {
     #[arg(short = 'd', long)]
     path: String,
 
-    /// Port to listen on for incoming connections
+    /// Port to listen on (default: 9000)
     #[arg(short = 'p', long, default_value_t = 9000)]
     port: u16,
 
@@ -38,14 +38,19 @@ struct Args {
     #[arg(short = 'n', long, default_value = "dsync-instance")]
     name: String,
 
-    /// Disable automatic peer discovery
+    /// Disable automatic local peer discovery
     #[arg(long, default_value_t = false)]
     no_discovery: bool,
+
+    /// Show detailed connection logs
+    #[arg(short = 'v', long, default_value_t = false)]
+    verbose: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let verbose = args.verbose;
 
     // generate ephemeral identity
     let mut csprng = OsRng{};
@@ -83,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
         let folder_clone = folder_path.clone();
         let instance_id_clone = instance_id.clone();
         async move {
-            if let Err(e) = network::start_server(port, folder_clone, tx_clone, instance_id_clone).await {
+            if let Err(e) = network::start_server(port, folder_clone, tx_clone, instance_id_clone, verbose).await {
                 eprintln!("Server error: {:?}", e);
             }
         }
@@ -99,12 +104,13 @@ async fn main() -> anyhow::Result<()> {
                     let hash = blake3::hash(&contents);
                     let mut map = last_hashes_clone.lock().await;
                     map.insert(event.file_path().clone(), hash);
-                    println!("Received: {:?}", event.file_path());
                 }
                 continue;
             }
             
-            // println!("Got FileEvent in main: {:?}", event);
+            if verbose {
+                println!("Got FileEvent in main: {:?}", event);
+            }
 
             let current_hash = if matches!(event.operation(), EventOp::Delete) {
                 None

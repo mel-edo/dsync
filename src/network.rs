@@ -1,20 +1,25 @@
-use std::{collections::HashMap, fs::{self, OpenOptions, create_dir_all, remove_file}, io::{Read, Write}, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, fs::{self, create_dir_all, remove_file}, io::Read, path::PathBuf, sync::Arc, time::Instant};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::{TcpListener, TcpStream}, sync::{mpsc, Mutex}, time::{timeout, Duration}};
 use anyhow::{Context, bail};
 use crate::event::{EventOp, FileEvent, FileChunk};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
-use crate::protocol::{HandshakeMsg, TransferMsg};
+use crate::{protocol::{HandshakeMsg, TransferMsg}, util};
 
 const CHUNK_SIZE: usize = 64 * 1024;
 
-pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEvent>, instance_id: String) -> anyhow::Result<()> {
+pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEvent>, instance_id: String, verbose: bool) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    println!("Server listening on port {}", port);
+
+    if verbose {
+        println!("Server listening on port {}", port);
+    }
 
     loop {
         let (mut stream, addr) = listener.accept().await?;
-        println!("New connection from {:?}", addr);
+        if verbose {
+            println!("New connection from {:?}", addr);
+        }
         // spawn a new task with tokio::spawn to handle multiple peers
 
         let tx = sender.clone();
@@ -24,7 +29,11 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
         tokio::spawn(async move {
             // perform zero config handshake before receiving data
             match perform_server_handshake(&mut stream).await {
-                Ok(peer_id) => println!("Trust established with ID: {}", peer_id),
+                Ok(peer_id) => {
+                    if verbose {
+                        println!("Trust established with ID: {}", peer_id);
+                    }
+                },
                 Err(e) => {
                     eprintln!("Handshake failed: {:?}", e);
                     return;
@@ -32,6 +41,7 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
             }
 
             let mut reader = BufReader::new(stream);
+            let mut pending_transfers: HashMap<PathBuf, Instant> = HashMap::new();
 
             loop {
                 let mut len_buf = [0u8; 4];
@@ -52,6 +62,8 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                 if origin == &instance_id_clone { continue; }
                             }
 
+                            pending_transfers.insert(event.file_path().clone(), Instant::now());
+
                             match event.operation() {
                                 EventOp::Delete => {
                                     let full_path = root_clone.join(event.file_path());
@@ -71,38 +83,25 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                             }
                         },
                         TransferMsg::Chunk(chunk) => {
-                            let full_path = root_clone.join(&chunk.rel_path);
+                            match util::write_chunk_atomic(&root_clone, &chunk.rel_path, &chunk.data, chunk.is_last) {
+                                Ok(is_complete) => {
+                                    if is_complete {
+                                        let duration = if let Some(start) = pending_transfers.remove(&chunk.rel_path) {
+                                            format!("{:.2?}", start.elapsed())
+                                        } else {
+                                            "??s".to_string()
+                                        };
 
-                            let part_path = full_path.with_extension("part");
+                                        println!("Received: {:?} ({})", chunk.rel_path, duration);
 
-                            let mut options = OpenOptions::new();
-                            options.write(true).append(true).create(true);
-
-                            match options.open(&part_path) {
-                                Ok(mut file) => {
-                                    if let Err(e) = file.write_all(&chunk.data) {
-                                        eprintln!("Failed to write chunk: {:?}", e);
+                                        let event = FileEvent::new(EventOp::Create, chunk.rel_path, None)
+                                            .with_origin("network".to_string());
+                                        let _ = tx.send(event).await;
                                     }
                                 }
-                                Err(e) => eprintln!("Failed to append chunk to {:?}: {:?}", part_path, e),
+                                Err(e) => eprintln!("Write error: {:?}", e),
                             }
 
-                            // on last chunk -> rename .part to real file
-                            if chunk.is_last {
-                                if let Err(e) = fs::rename(&part_path, &full_path) {
-                                    eprintln!("Failed to rename partial file: {:?}", e);
-                                } else {
-                                    println!("Received: {:?}", full_path);
-
-                                    let event = FileEvent::new(
-                                        EventOp::Create,
-                                        chunk.rel_path,
-                                        None
-                                    ).with_origin("network".to_string());
-
-                                    let _ = tx.send(event).await;
-                                }
-                            }
                         }
                     },
                     Err(e) => eprintln!("Deserialize error: {:?}", e),
