@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
     let instance_id = args.name.clone();
 
     let (tx, mut rx) = mpsc::channel(100);
+    let (peer_tx, mut peer_rx) = mpsc::channel(100);
     let _watcher = watch_folder(folder_path.clone(), tx.clone()).await?;
 
     let last_hashes: Arc<Mutex<HashMap<PathBuf, Hash>>> = Arc::new(Mutex::new(HashMap::<PathBuf, Hash>::new()));
@@ -76,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
     let peer_discovery = if !args.no_discovery {
         let discovery = discovery::PeerDiscovery::new(my_id_hex)?;
         discovery.register_service(port, &args.name)?;
-        discovery.start_browsing().await?;
+        discovery.start_browsing(peer_tx).await?;
         Some(Arc::new(discovery))
     } else {
         None
@@ -90,6 +91,24 @@ async fn main() -> anyhow::Result<()> {
         async move {
             if let Err(e) = network::start_server(port, folder_clone, tx_clone, instance_id_clone, verbose).await {
                 eprintln!("Server error: {:?}", e);
+            }
+        }
+    });
+
+    let pool_clone = Arc::clone(&connection_pool);
+    let folder_clone_2 = folder_path.clone();
+    let tx_clone_2 = tx.clone();
+
+    tokio::spawn(async move {
+        while let Some(peer_addr) = peer_rx.recv().await {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            if verbose { println!("Initiating sync with {}", peer_addr); }
+
+            if let Err(e) = pool_clone.request_index(&peer_addr, folder_clone_2.clone(), tx_clone_2.clone()).await {
+                eprintln!("Sync failed with {}: {:?}", peer_addr, e);
+            } else {
+                if verbose { println!("Sync check complete with {}", peer_addr); }
             }
         }
     });

@@ -16,4 +16,13 @@ pub enum HandshakeMsg {
 pub enum TransferMsg {
     Event(FileEvent),
     Chunk(FileChunk),
+    IndexRequest,
+    IndexResponse(Vec<FileInfo>),
+    RequestFile(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileInfo {
+    pub path: String,
+    pub hash: String,
 }

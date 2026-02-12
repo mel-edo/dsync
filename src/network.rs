@@ -1,10 +1,10 @@
-use std::{collections::HashMap, fs::{self, create_dir_all, remove_file}, io::Read, path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashMap, fs, io::Read, path::PathBuf, sync::Arc, time::Instant};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::{TcpListener, TcpStream}, sync::{mpsc, Mutex}, time::{timeout, Duration}};
 use anyhow::{Context, bail};
 use crate::event::{EventOp, FileEvent, FileChunk};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
-use crate::{protocol::{HandshakeMsg, TransferMsg}, util};
+use crate::{protocol::{HandshakeMsg, TransferMsg}, util, sync};
 
 const CHUNK_SIZE: usize = 64 * 1024;
 
@@ -17,46 +17,71 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
 
     loop {
         let (mut stream, addr) = listener.accept().await?;
-        if verbose {
-            println!("New connection from {:?}", addr);
-        }
-        // spawn a new task with tokio::spawn to handle multiple peers
+        if verbose { println!("New connection from {:?}", addr); }
 
+        // spawn a new task with tokio::spawn to handle multiple peers
         let tx = sender.clone();
         let root_clone = root.clone();
         let instance_id_clone = instance_id.clone();
 
         tokio::spawn(async move {
-            // perform zero config handshake before receiving data
-            match perform_server_handshake(&mut stream).await {
-                Ok(peer_id) => {
-                    if verbose {
-                        println!("Trust established with ID: {}", peer_id);
-                    }
-                },
-                Err(e) => {
-                    eprintln!("Handshake failed: {:?}", e);
-                    return;
-                }
+            if let Err(e) = perform_server_handshake(&mut stream).await {
+                eprintln!("Handshake failed: {:?}", e);
+                return;
             }
 
-            let mut reader = BufReader::new(stream);
+            // split stream into read/write halves for bidirectional communication
+            let (reader, mut writer) = stream.into_split();
+            let mut buf_reader = BufReader::new(reader);
             let mut pending_transfers: HashMap<PathBuf, Instant> = HashMap::new();
 
             loop {
                 let mut len_buf = [0u8; 4];
-                if let Err(_) = reader.read_exact(&mut len_buf).await { break; }
-                
+                if let Err(_) = buf_reader.read_exact(&mut len_buf).await { break; }
                 let msg_len = u32::from_be_bytes(len_buf) as usize;
-                let mut buffer = vec![0u8; msg_len];
 
-                if let Err(e) = reader.read_exact(&mut buffer).await {
-                    eprintln!("Failed to read message: {:?}", e);
-                    break;
-                }
+                let mut buffer = vec![0u8; msg_len];
+                if let Err(_) = buf_reader.read_exact(&mut buffer).await { break; }
 
                 match bincode::deserialize::<TransferMsg>(&buffer) {
+                    
+                    // peer wants our file list
                     Ok(msg) => match msg {
+                        TransferMsg::IndexRequest => {
+                            if verbose { println!("Received Index Request"); }
+                            let index = sync::generate_local_index(&root_clone);
+                            send_msg(&mut writer, &TransferMsg::IndexResponse(index)).await.ok();
+                        },
+
+                        // peer sent us their list
+                        TransferMsg::IndexResponse(remote_index) => {
+                            if verbose { println!("Received Remote Index ({} files)", remote_index.len()); }
+                            let local_index = sync::generate_local_index(&root_clone);
+                            let missing = sync::calculate_diff(&local_index, &remote_index);
+
+                            for path in missing {
+                                if verbose { println!("Requesting: {}", path); }
+                                send_msg(&mut writer, &TransferMsg::RequestFile(path)).await.ok();
+                            }
+                        },
+
+                        // peer requested a specific file, send it
+                        TransferMsg::RequestFile(path) => {
+                            if verbose { println!("Sending requested file: {}", path); }
+                            let file_path = PathBuf::from(&path);
+
+                            // send metadata first
+                            let event = FileEvent::new(EventOp::Create, file_path.clone(), None);
+                            if let Err(e) = send_msg(&mut writer, &TransferMsg::Event(event.clone())).await {
+                                eprintln!("Failed to send event: {:?}", e);
+                            }
+
+                            // stream the file content using helper
+                            if let Err(e) = stream_file_to_writer(&mut writer, &root_clone, &file_path).await {
+                                eprintln!("Failed to stream file {}: {:?}", path, e);
+                            }
+                        },
+
                         TransferMsg::Event(event) => {
                             if let Some(origin) = event.origin_id() {
                                 if origin == &instance_id_clone { continue; }
@@ -67,18 +92,13 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                             match event.operation() {
                                 EventOp::Delete => {
                                     let full_path = root_clone.join(event.file_path());
-                                    if full_path.exists() {
-                                        let _ = remove_file(&full_path);
-                                        println!("Deleted: {:?}", full_path);
-                                    }
+                                    if full_path.exists() { let _ = fs::remove_file(&full_path); }
+                                    println!("Deleted: {:?}", event.file_path());
                                     let _ = tx.send(event).await;
                                 }
                                 EventOp::Create | EventOp::Modify => {
                                     let full_path = root_clone.join(event.file_path());
-
-                                    if let Some(parent) = full_path.parent() {
-                                        let _ = create_dir_all(parent);
-                                    }
+                                    util::ensure_parent(&full_path).ok();
                                 }
                             }
                         },
@@ -91,7 +111,6 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                         } else {
                                             "??s".to_string()
                                         };
-
                                         println!("Received: {:?} ({})", chunk.rel_path, duration);
 
                                         let event = FileEvent::new(EventOp::Create, chunk.rel_path, None)
@@ -101,10 +120,9 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                 }
                                 Err(e) => eprintln!("Write error: {:?}", e),
                             }
-
                         }
                     },
-                    Err(e) => eprintln!("Deserialize error: {:?}", e),
+                    Err(_) => break,
                 }
             }
         });
@@ -124,43 +142,99 @@ impl ConnectionPool {
         }
     }
 
+    pub async fn request_index(&self, addr: &str, root:PathBuf, tx: mpsc::Sender<FileEvent>) -> anyhow::Result<()> {
+        let mut stream = self.acquire_stream(addr).await?;
+
+        let msg = TransferMsg::IndexRequest;
+        let serialized = bincode::serialize(&msg)?;
+        stream.write_all(&(serialized.len() as u32).to_be_bytes()).await?;
+        stream.write_all(&serialized).await?;
+
+        let mut reader = BufReader::new(stream);
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf).await?;
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut buffer = vec![0u8; msg_len];
+        reader.read_exact(&mut buffer).await?;
+
+        let remote_index = match bincode::deserialize::<TransferMsg>(&buffer)? {
+            TransferMsg::IndexResponse(idx) => idx,
+            _ => bail!("Expected IndexResponse"),
+        };
+
+        let local_index = sync::generate_local_index(&root);
+        let missing_files = sync::calculate_diff(&local_index, &remote_index);
+
+        if missing_files.is_empty() {
+            self.store_stream(addr, reader.into_inner()).await;
+            return Ok(());
+        }
+        println!("Syncing {} missing files from {}", missing_files.len(), addr);
+
+        let mut stream = reader.into_inner();
+
+        for path in missing_files {
+            let req = TransferMsg::RequestFile(path.clone());
+            let ser_req = bincode::serialize(&req)?;
+            stream.write_all(&(ser_req.len() as u32).to_be_bytes()).await?;
+            stream.write_all(&ser_req).await?;
+
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut event_buf = vec![0u8; len];
+            stream.read_exact(&mut event_buf).await?;
+
+            let _event_msg = bincode::deserialize::<TransferMsg>(&event_buf)?;
+
+            loop {
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).await?;
+                let chunk_len = u32::from_be_bytes(len_buf) as usize;
+
+                let mut chunk_buf = vec![0u8; chunk_len];
+                stream.read_exact(&mut chunk_buf).await?;
+
+                if let TransferMsg::Chunk(chunk) = bincode::deserialize(&chunk_buf)? {
+                    let is_last = chunk.is_last;
+                    let rel_path = chunk.rel_path.clone();
+
+                    util::write_chunk_atomic(&root, &rel_path, &chunk.data, is_last)?;
+
+                    if is_last {
+                        println!("Synced: {:?}", rel_path);
+                        let event = FileEvent::new(EventOp::Create, rel_path, None)
+                            .with_origin("network".to_string());
+                        let _ = tx.send(event).await;
+                        break;
+                    }
+                } else {
+                    bail!("Expected Chunk");
+                }
+            }
+        }
+        self.store_stream(addr, stream).await;
+        Ok(())
+    }
+
     pub async fn send_event(&self, addr: &str, event: &FileEvent, root_path: &PathBuf) -> anyhow::Result<()> {
         let mut stream = self.acquire_stream(addr).await?;
 
         let event_msg = TransferMsg::Event(event.clone());
         let serialized = bincode::serialize(&event_msg)?;
-
         stream.write_all(&(serialized.len() as u32).to_be_bytes()).await?;
         stream.write_all(&serialized).await?;
 
         if matches!(event.operation(), EventOp::Create | EventOp::Modify) {
-            let full_path = root_path.join(event.file_path());
+            let (reader, mut writer) = stream.into_split();
 
-            if let Ok(mut file) = fs::File::open(&full_path) {
-                let mut buffer = [0u8; CHUNK_SIZE];
-                let mut offset = 0;
+            stream_file_to_writer(&mut writer, root_path, event.file_path()).await?;
 
-                loop {
-                    let bytes_read = file.read(&mut buffer)?;
-                    if bytes_read == 0 { break; }
+            let reunited_stream = reader.reunite(writer).unwrap();
+            stream = reunited_stream;
 
-                    let chunk = FileChunk {
-                        rel_path: event.file_path().clone(),
-                        offset,
-                        data: buffer[..bytes_read].to_vec(),
-                        is_last: bytes_read < CHUNK_SIZE,
-                    };
-
-                    let chunk_msg = TransferMsg::Chunk(chunk);
-                    let serialized_chunk = bincode::serialize(&chunk_msg)?;
-
-                    stream.write_all(&(serialized_chunk.len() as u32).to_be_bytes()).await?;
-                    stream.write_all(&serialized_chunk).await?;
-
-                    offset += bytes_read as u64;
-                }
-                println!("Sent: {:?}", event.file_path());
-            }
+            println!("Sent: {:?}", event.file_path());
         }
         self.store_stream(addr, stream).await;
         Ok(())
@@ -221,6 +295,39 @@ impl ConnectionPool {
         let mut guard = self.streams.lock().await;
         guard.insert(addr.to_string(), stream);
     }
+}
+
+// helpers
+
+// helper to send any TransferMsg
+async fn send_msg(writer: &mut tokio::net::tcp::OwnedWriteHalf, msg: &TransferMsg) -> anyhow::Result<()> {
+    let serialized = bincode::serialize(msg)?;
+    writer.write_all(&(serialized.len() as u32).to_be_bytes()).await?;
+    writer.write_all(&serialized).await?;
+    Ok(())
+}
+
+// helper to chunk and stream a file
+async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, root: &PathBuf, rel_path: &PathBuf) -> anyhow::Result<()> {
+    let full_path = root.join(rel_path);
+    if let Ok(mut file) = fs::File::open(&full_path) {
+        let mut buffer = [0u8; CHUNK_SIZE];
+        loop {
+            let bytes_read = file.read(&mut buffer)?;
+            if bytes_read == 0 { break; }
+
+            let chunk = FileChunk {
+                rel_path: rel_path.clone(),
+                offset: 0,
+                data: buffer[..bytes_read].to_vec(),
+                is_last: bytes_read < CHUNK_SIZE,
+            };
+
+            let chunk_msg = TransferMsg::Chunk(chunk);
+            send_msg(writer, &chunk_msg).await?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn perform_server_handshake(stream: &mut TcpStream) -> anyhow::Result<String> {

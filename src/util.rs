@@ -1,5 +1,5 @@
 use std::{fs::{self, OpenOptions, create_dir_all}, io::Write, path::PathBuf};
-use anyhow::{Context, Ok};
+use anyhow::Context;
 
 // ensure the parent directory exists for a given path
 pub fn ensure_parent(path: &PathBuf) -> anyhow::Result<()> {

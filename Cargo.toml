@@ -18,3 +18,4 @@ get_if_addrs = "0.5"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 hex = "0.4"
+walkdir = "2.5.0"
