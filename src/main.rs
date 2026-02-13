@@ -1,7 +1,7 @@
-use std::{collections::HashMap, fs::read, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use clap::Parser;
 use blake3::Hash;
-use tokio::sync::{mpsc, Mutex};
+use tokio::{sync::{mpsc, Mutex}, io::AsyncReadExt};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
@@ -70,7 +70,6 @@ async fn main() -> anyhow::Result<()> {
     let _watcher = watch_folder(folder_path.clone(), tx.clone()).await?;
 
     let last_hashes: Arc<Mutex<HashMap<PathBuf, Hash>>> = Arc::new(Mutex::new(HashMap::<PathBuf, Hash>::new()));
-    let last_hashes_clone: Arc<Mutex<HashMap<PathBuf, Hash>>> = Arc::clone(&last_hashes);
     let connection_pool = Arc::new(ConnectionPool::new(keypair));
 
     // setup mdns discovery
@@ -95,81 +94,110 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let pool_clone = Arc::clone(&connection_pool);
-    let folder_clone_2 = folder_path.clone();
-    let tx_clone_2 = tx.clone();
+    {
+        let pool = Arc::clone(&connection_pool);
+        let folder = folder_path.clone();
+        let tx_clone = tx.clone();
 
-    tokio::spawn(async move {
-        while let Some(peer_addr) = peer_rx.recv().await {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tokio::spawn(async move {
+            while let Some(peer_addr) = peer_rx.recv().await {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-            if verbose { println!("Initiating sync with {}", peer_addr); }
+                if verbose { println!("Initiating sync with {}", peer_addr); }
 
-            if let Err(e) = pool_clone.request_index(&peer_addr, folder_clone_2.clone(), tx_clone_2.clone()).await {
-                eprintln!("Sync failed with {}: {:?}", peer_addr, e);
-            } else {
-                if verbose { println!("Sync check complete with {}", peer_addr); }
+                if let Err(e) = pool.request_index(&peer_addr, folder.clone(), tx_clone.clone()).await {
+                    eprintln!("Sync failed with {}: {:?}", peer_addr, e);
+                } else {
+                    if verbose { println!("Sync check complete with {}", peer_addr); }
+                }
             }
-        }
-    });
+        });
+    }
 
     // forward events to peers
-    tokio::spawn(async move {
+    {
         let connection_pool = Arc::clone(&connection_pool);
-        while let Some(mut event) = rx.recv().await {
-            if event.origin_id().is_some() {
-                let abs_path = folder_path.join(event.file_path());
-                if let Ok(contents) = read(&abs_path) {
-                    let hash = blake3::hash(&contents);
-                    let mut map = last_hashes_clone.lock().await;
-                    map.insert(event.file_path().clone(), hash);
-                }
-                continue;
-            }
-            
-            if verbose { println!("Got FileEvent in main: {:?}", event); }
+        let folder_path = folder_path.clone();
+        let peer_addr = peer_addr.clone();
+        let peer_discovery = peer_discovery.clone();
+        let last_hashes = Arc::clone(&last_hashes);
+        let instance_id = instance_id.clone();
 
-            let current_hash = if matches!(event.operation(), EventOp::Delete) {
-                None
-            } else {
-                let abs_path = folder_path.join(event.file_path());
-                match read(&abs_path) {
-                    Ok(contents) => Some(blake3::hash(&contents)),
-                    Err(_) => None,
-                }
-            };
-
-            let mut map = last_hashes_clone.lock().await;
-            match current_hash {
-                Some(hash) => {
-                    if let Some(prev_hash) = map.get(event.file_path().as_path()) {
-                        if *prev_hash == hash { continue; }
+        tokio::spawn(async move {
+            while let Some(mut event) = rx.recv().await {
+                if event.origin_id().is_some() {
+                    let abs_path = folder_path.join(event.file_path());
+    
+                    if let Ok(mut file) = tokio::fs::File::open(&abs_path).await {
+                        let mut hasher = blake3::Hasher::new();
+                        let mut buffer = vec![0u8; 64 * 1024];
+    
+                        while let Ok(n) = file.read(&mut buffer).await {
+                            if n == 0 { break; }
+                            hasher.update(&buffer[..n]);
+                        }
+    
+                        let hash = hasher.finalize();
+                        let mut map = last_hashes.lock().await;
+                        map.insert(event.file_path().clone(), hash);
                     }
-                    map.insert(event.file_path().clone(), hash);
+    
+                    continue;
                 }
-                None => { map.remove(event.file_path().as_path()); }
-            }
+    
+                if verbose { println!("Got FileEvent in main: {:?}", event); }
+                let current_hash = if matches!(event.operation(), EventOp::Delete) {
+                    None
+                } else {
+                    let abs_path = folder_path.join(event.file_path());
+                    match tokio::fs::File::open(&abs_path).await {
+                        Ok(mut file) => {
+                            let mut hasher = blake3::Hasher::new();
+                            let mut buffer = vec![0u8; 64 * 1024];
             
-            // adding orgin id to prevent loops
-            event = event.with_origin(instance_id.clone());
+                            while let Ok(n) = file.read(&mut buffer).await {
+                                if n == 0 { break; }
+                                hasher.update(&buffer[..n]);
+                            }
+                            Some(hasher.finalize())
+                        }
+                        Err(_) => None,
+                    }
+                };
 
-            // get peers to send to
-            let mut peers = Vec::new();
-            if let Some(ref peer) = peer_addr {
-                peers.push(peer.clone());
-            }
-            if let Some(ref discovery) = peer_discovery {
-                peers.extend(discovery.get_peers().await);
-            }
-
-            for peer in peers {
-                if let Err(e) = connection_pool.send_event(&peer, &event, &folder_path).await {
-                    eprintln!("Failed to send event to {}: {:?}", peer, e);
+                {
+                    let mut map = last_hashes.lock().await;
+                    match current_hash {
+                        Some(hash) => {
+                            if let Some(prev_hash) = map.get(event.file_path().as_path()) {
+                                if *prev_hash == hash { continue; }
+                            }
+                            map.insert(event.file_path().clone(), hash);
+                        }
+                        None => { map.remove(event.file_path().as_path()); }
+                    }
                 }
-            }
-        }
-    });
+                
+                // adding orgin id to prevent loops
+                event = event.with_origin(instance_id.clone());
 
+                // get peers to send to
+                let mut peers = Vec::new();
+                if let Some(ref peer) = peer_addr {
+                    peers.push(peer.clone());
+                }
+                if let Some(ref discovery) = peer_discovery {
+                    peers.extend(discovery.get_peers().await);
+                }
+
+                for peer in peers {
+                    if let Err(e) = connection_pool.send_event(&peer, &event, &folder_path).await {
+                        eprintln!("Failed to send event to {}: {:?}", peer, e);
+                        }
+                    }
+                }
+        });
+    }
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3000)).await;
     }

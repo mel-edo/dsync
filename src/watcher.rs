@@ -5,7 +5,6 @@ use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use crate::event::{FileEvent, EventOp};
 use blake3::Hasher;
 
-const DEBOUNCE_MS: u64 = 500;
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
 
 pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> notify::Result<RecommendedWatcher> {
@@ -39,48 +38,82 @@ pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
 
                 handle.spawn(async move {
                     // debounce per file
-                    {
+                    let should_process = {
                         let mut map = debounce.lock().await;
-                        let now = Instant::now();
-
-                        if let Some(last) = map.get(&path) {
-                            if now.duration_since(*last).as_millis() < DEBOUNCE_MS as u128 {
-                                return;
+                        if let Some(&last_time) = map.get(&path) {
+                            if last_time.elapsed() < std::time::Duration::from_secs(2) {
+                                false
+                            } else {
+                                map.insert(path.clone(), Instant::now());
+                                true
                             }
+                        } else {
+                            map.insert(path.clone(), Instant::now());
+                            true
                         }
-                        map.insert(path.clone(), now);
-                    }
-
-                    let relative = match diff_paths(&path, &root) {
-                        Some(p) => p,
-                        None => return,
                     };
 
-                    match tokio::fs::metadata(&path).await {
-                        Ok(meta) => {
-                            if meta.is_dir() {
-                                return;
-                            }
+                    if !should_process {
+                        return;
+                    }
 
-                            match hash_file(&path).await {
-                                Ok(hash) => {
-                                    let event = FileEvent::new(EventOp::Modify, relative, Some(hash));
+                    let _ = async {
+
+                        let relative = match diff_paths(&path, &root) {
+                            Some(p) => p,
+                            None => return,
+                        };
+        
+                        match tokio::fs::metadata(&path).await {
+                            Ok(meta) => {
+                                if meta.is_dir() {
+                                    return;
+                                }
+        
+                                let mut last_size = meta.len();
+                                let mut last_modified = meta.modified().ok();
+        
+                                loop {
+                                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        
+                                    match tokio::fs::metadata(&path).await {
+                                        Ok(new_meta) => {
+                                            let new_size = new_meta.len();
+                                            let new_modified = new_meta.modified().ok();
+        
+                                            if new_size == last_size && new_modified == last_modified {
+                                                break;
+                                            }
+        
+                                            last_size = new_size;
+                                            last_modified = new_modified;
+                                        }
+                                        Err(_) => return,
+                                    }
+                                }
+        
+                                match hash_file(&path).await {
+                                    Ok(hash) => {
+                                        let event = FileEvent::new(EventOp::Modify, relative, Some(hash));
+                                        let _ = tx.send(event).await;
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::NotFound {
+                                    let event = FileEvent::new(EventOp::Delete, relative, None);
                                     let _ = tx.send(event).await;
                                 }
-                                Err(_) => {}
-                            }
-                        }
-                        Err(e) => {
-                            if e.kind() == std::io::ErrorKind::NotFound {
-                                let event = FileEvent::new(EventOp::Delete, relative, None);
-                                let _ = tx.send(event).await;
                             }
                         }
                     }
+                    .await;
                 });
             }
         },
-        Config::default())?;
+        Config::default(),
+    )?;
     file_watcher.watch(&root, RecursiveMode::Recursive)?;
     Ok(file_watcher)
 }
