@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::UNIX_EPOCH};
 use walkdir::WalkDir;
 use crate::protocol::FileInfo;
 
@@ -17,18 +17,26 @@ pub fn generate_local_index(root: &Path) -> Vec<FileInfo> {
             if let Ok(rel_path) = path.strip_prefix(root) {
                 let rel_path_str = rel_path.to_string_lossy().replace("\\", "/");
 
-                if let Ok(contents) = fs::read(path) {
-                    let hash = blake3::hash(&contents).to_string();
+                if let Ok(metadata) = fs::metadata(path) {
+                    let size = metadata.len();
+                    let modified = metadata.modified()
+                        .unwrap_or(UNIX_EPOCH)
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    
+                    let hash = "CHECK_METADATA".to_string();
 
                     index.push(FileInfo {
                         path: rel_path_str,
                         hash,
+                        size,
+                        modified,
                     });
                 }
             }
         }
     }
-
     index
 }
 
@@ -41,8 +49,8 @@ pub fn calculate_diff(local: &[FileInfo], remote: &[FileInfo]) -> Vec<String> {
 
         match match_found {
             Some(local_file) => {
-                if local_file.hash != remote_file.hash {
-                    println!("Outdated: {}", remote_file.path); // optional log
+                if local_file.size != remote_file.size || local_file.modified < remote_file.modified {
+                    println!("Outdated: {} (Size: {} vs {}, Time: {} vs {})", remote_file.path, local_file.size, remote_file.size, local_file.modified, remote_file.modified); // optional log
                     missing_files.push(remote_file.path.clone());
                 }
             },
@@ -52,6 +60,5 @@ pub fn calculate_diff(local: &[FileInfo], remote: &[FileInfo]) -> Vec<String> {
             }
         }
     }
-    
     missing_files
 }

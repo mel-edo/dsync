@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     let folder_path = PathBuf::from(args.path);
     let port = args.port;
     let peer_addr = args.peer;
-    let instance_id = args.name.clone();
+    let instance_id = my_id_hex.clone();
 
     let (tx, mut rx) = mpsc::channel(100);
     let (peer_tx, mut peer_rx) = mpsc::channel(100);
@@ -127,9 +127,7 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
             
-            if verbose {
-                println!("Got FileEvent in main: {:?}", event);
-            }
+            if verbose { println!("Got FileEvent in main: {:?}", event); }
 
             let current_hash = if matches!(event.operation(), EventOp::Delete) {
                 None

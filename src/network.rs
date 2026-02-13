@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, io::Read, path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashMap, fs, io::{Read, Write}, path::PathBuf, sync::Arc, time::Instant};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::{TcpListener, TcpStream}, sync::{mpsc, Mutex}, time::{timeout, Duration}};
 use anyhow::{Context, bail};
 use crate::event::{EventOp, FileEvent, FileChunk};
@@ -6,14 +6,12 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
 use crate::{protocol::{HandshakeMsg, TransferMsg}, util, sync};
 
-const CHUNK_SIZE: usize = 64 * 1024;
+const CHUNK_SIZE: usize = 1024 * 1024;
 
 pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEvent>, instance_id: String, verbose: bool) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
 
-    if verbose {
-        println!("Server listening on port {}", port);
-    }
+    if verbose { println!("Server listening on port {}", port); }
 
     loop {
         let (mut stream, addr) = listener.accept().await?;
@@ -33,6 +31,9 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
             // split stream into read/write halves for bidirectional communication
             let (reader, mut writer) = stream.into_split();
             let mut buf_reader = BufReader::new(reader);
+            
+            let mut current_file_path: Option<String> = None;
+            let mut current_file: Option<std::fs::File> = None;
             let mut pending_transfers: HashMap<PathBuf, Instant> = HashMap::new();
 
             loop {
@@ -72,9 +73,7 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
 
                             // send metadata first
                             let event = FileEvent::new(EventOp::Create, file_path.clone(), None);
-                            if let Err(e) = send_msg(&mut writer, &TransferMsg::Event(event.clone())).await {
-                                eprintln!("Failed to send event: {:?}", e);
-                            }
+                            send_msg(&mut writer, &TransferMsg::Event(event)).await.ok();
 
                             // stream the file content using helper
                             if let Err(e) = stream_file_to_writer(&mut writer, &root_clone, &file_path).await {
@@ -103,22 +102,49 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                             }
                         },
                         TransferMsg::Chunk(chunk) => {
-                            match util::write_chunk_atomic(&root_clone, &chunk.rel_path, &chunk.data, chunk.is_last) {
-                                Ok(is_complete) => {
-                                    if is_complete {
-                                        let duration = if let Some(start) = pending_transfers.remove(&chunk.rel_path) {
-                                            format!("{:.2?}", start.elapsed())
-                                        } else {
-                                            "??s".to_string()
-                                        };
-                                        println!("Received: {:?} ({})", chunk.rel_path, duration);
+                            let rel_path_str = chunk.rel_path.to_string_lossy().to_string();
+                            let full_path = root_clone.join(&chunk.rel_path);
 
-                                        let event = FileEvent::new(EventOp::Create, chunk.rel_path, None)
-                                            .with_origin("network".to_string());
-                                        let _ = tx.send(event).await;
+                            if current_file_path.as_ref() != Some(&rel_path_str) {
+                                util::ensure_parent(&full_path).ok();
+
+                                match fs::OpenOptions::new().create(true).write(true).append(true).open(full_path.with_extension("part")) {
+                                    Ok(f) => {
+                                        current_file = Some(f);
+                                        current_file_path = Some(rel_path_str.clone());
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to open part file: {:?}", e);
+                                        current_file = None;
+                                        current_file_path = None;
                                     }
                                 }
-                                Err(e) => eprintln!("Write error: {:?}", e),
+                            }
+
+                            if let Some(file) = current_file.as_mut() {
+                                if let Err(e) = file.write_all(&chunk.data) {
+                                    eprintln!("Write error: {:?}", e);
+                                    current_file = None;
+                                }
+                            }
+
+                            if chunk.is_last {
+                                current_file = None;
+                                current_file_path = None;
+
+                                let part_path = full_path.with_extension("part");
+                                if let Ok(_) = fs::rename(&part_path, &full_path) {
+                                    let duration = if let Some(start) = pending_transfers.remove(&chunk.rel_path) {
+                                        format!("{:.2?}", start.elapsed())
+                                    } else {
+                                        "??s".to_string()
+                                    };
+                                    println!("Received: {:?} ({})", chunk.rel_path, duration);
+
+                                    let event = FileEvent::new(EventOp::Create, chunk.rel_path, None)
+                                        .with_origin("network".to_string());
+                                    let _ = tx.send(event).await;
+                                }
                             }
                         }
                     },
@@ -174,44 +200,63 @@ impl ConnectionPool {
 
         let mut stream = reader.into_inner();
 
-        for path in missing_files {
+        for path in &missing_files {
             let req = TransferMsg::RequestFile(path.clone());
             let ser_req = bincode::serialize(&req)?;
             stream.write_all(&(ser_req.len() as u32).to_be_bytes()).await?;
             stream.write_all(&ser_req).await?;
+        }
 
+        let mut files_remaining = missing_files.len();
+        let mut current_file: Option<std::fs::File> = None;
+        let mut current_file_path: Option<String> = None;
+
+        while files_remaining > 0 {
             let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).await?;
+            if let Err(_) = stream.read_exact(&mut len_buf).await { break; }
             let len = u32::from_be_bytes(len_buf) as usize;
             let mut event_buf = vec![0u8; len];
             stream.read_exact(&mut event_buf).await?;
 
-            let _event_msg = bincode::deserialize::<TransferMsg>(&event_buf)?;
+            match bincode::deserialize::<TransferMsg>(&event_buf)? {
+                TransferMsg::Event(e) => {
+                    if matches!(e.operation(), EventOp::Create | EventOp::Modify) {
+                        let full = root.join(e.file_path());
+                        util::ensure_parent(&full).ok();
+                    }
+                },
+                TransferMsg::Chunk(chunk) => {
+                    let rel_path_str = chunk.rel_path.to_string_lossy().to_string();
+                    let full_path = root.join(&chunk.rel_path);
 
-            loop {
-                let mut len_buf = [0u8; 4];
-                stream.read_exact(&mut len_buf).await?;
-                let chunk_len = u32::from_be_bytes(len_buf) as usize;
+                    if current_file_path.as_ref() != Some(&rel_path_str) {
+                        util::ensure_parent(&full_path)?;
+                        let f = fs::OpenOptions::new().write(true).create(true).append(true)
+                            .open(full_path.with_extension("part"))?;
+                        current_file = Some(f);
+                        current_file_path = Some(rel_path_str);
+                    }
 
-                let mut chunk_buf = vec![0u8; chunk_len];
-                stream.read_exact(&mut chunk_buf).await?;
+                    if let Some(file) = current_file.as_mut() {
+                        file.write_all(&chunk.data)?;
+                    }
 
-                if let TransferMsg::Chunk(chunk) = bincode::deserialize(&chunk_buf)? {
-                    let is_last = chunk.is_last;
-                    let rel_path = chunk.rel_path.clone();
+                    if chunk.is_last {
+                        current_file = None;
+                        current_file_path = None;
 
-                    util::write_chunk_atomic(&root, &rel_path, &chunk.data, is_last)?;
+                        let part_path = full_path.with_extension("part");
+                        fs::rename(&part_path, &full_path)?;
 
-                    if is_last {
-                        println!("Synced: {:?}", rel_path);
-                        let event = FileEvent::new(EventOp::Create, rel_path, None)
+                        println!("Synced: {:?}", chunk.rel_path);
+                        let event = FileEvent::new(EventOp::Create, chunk.rel_path, None)
                             .with_origin("network".to_string());
                         let _ = tx.send(event).await;
-                        break;
+
+                        files_remaining -= 1;
                     }
-                } else {
-                    bail!("Expected Chunk");
                 }
+                _ => {}
             }
         }
         self.store_stream(addr, stream).await;

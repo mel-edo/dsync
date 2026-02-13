@@ -25,4 +25,6 @@ pub enum TransferMsg {
 pub struct FileInfo {
     pub path: String,
     pub hash: String,
+    pub size: u64,
+    pub modified: u64,
 }
