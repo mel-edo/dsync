@@ -1,16 +1,16 @@
 use std::{collections::HashMap, fs, io::{Read, Write}, path::PathBuf, sync::Arc, time::Instant};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::{TcpListener, TcpStream}, sync::{mpsc, Mutex}, time::{timeout, Duration}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::{TcpListener, TcpStream}, sync::mpsc, time::{timeout, Duration}};
 use anyhow::{Context, bail};
 use crate::event::{EventOp, FileEvent, FileChunk};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
 use crate::{protocol::{HandshakeMsg, TransferMsg}, util, sync};
+use blake3;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 
 pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEvent>, instance_id: String, verbose: bool) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-
     if verbose { println!("Server listening on port {}", port); }
 
     loop {
@@ -34,6 +34,7 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
             
             let mut current_file_path: Option<String> = None;
             let mut current_file: Option<std::fs::File> = None;
+            let mut current_hasher: Option<blake3::Hasher> = None;
             let mut pending_transfers: HashMap<PathBuf, Instant> = HashMap::new();
 
             loop {
@@ -112,11 +113,12 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                     Ok(f) => {
                                         current_file = Some(f);
                                         current_file_path = Some(rel_path_str.clone());
+                                        current_hasher = Some(blake3::Hasher::new());
                                     }
                                     Err(e) => {
                                         eprintln!("Failed to open part file: {:?}", e);
                                         current_file = None;
-                                        current_file_path = None;
+                                        current_hasher = None;
                                     }
                                 }
                             }
@@ -127,10 +129,18 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                     current_file = None;
                                 }
                             }
+                            if let Some(hasher) = current_hasher.as_mut() {
+                                hasher.update(&chunk.data);
+                            }
 
                             if chunk.is_last {
+                                let hash_str = current_hasher.take().map(|h| h.finalize().to_hex().to_string());
                                 current_file = None;
                                 current_file_path = None;
+
+                                let event = FileEvent::new(EventOp::Create, chunk.rel_path.clone(), hash_str)
+                                    .with_origin("network".to_string());
+                                let _ = tx.send(event).await;
 
                                 let part_path = full_path.with_extension("part");
                                 if let Ok(_) = fs::rename(&part_path, &full_path) {
@@ -140,10 +150,6 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                         "??s".to_string()
                                     };
                                     println!("Received: {:?} ({})", chunk.rel_path, duration);
-
-                                    let event = FileEvent::new(EventOp::Create, chunk.rel_path, None)
-                                        .with_origin("network".to_string());
-                                    let _ = tx.send(event).await;
                                 }
                             }
                         }
@@ -156,14 +162,14 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
 }
 
 pub struct ConnectionPool {
-    streams: Mutex<HashMap<String, TcpStream>>,
+    // streams: Mutex<HashMap<String, TcpStream>>,
     my_keypair: Arc<SigningKey>,
 }
 
 impl ConnectionPool {
     pub fn new(keypair: SigningKey) -> Self {
         Self {
-            streams: Mutex::new(HashMap::new()),
+            // streams: Mutex::new(HashMap::new()),
             my_keypair: Arc::new(keypair),
         }
     }
@@ -193,7 +199,7 @@ impl ConnectionPool {
         let missing_files = sync::calculate_diff(&local_index, &remote_index);
 
         if missing_files.is_empty() {
-            self.store_stream(addr, reader.into_inner()).await;
+            // self.store_stream(addr, reader.into_inner()).await;
             return Ok(());
         }
         println!("Syncing {} missing files from {}", missing_files.len(), addr);
@@ -210,6 +216,7 @@ impl ConnectionPool {
         let mut files_remaining = missing_files.len();
         let mut current_file: Option<std::fs::File> = None;
         let mut current_file_path: Option<String> = None;
+        let mut current_hasher: Option<blake3::Hasher> = None;
 
         while files_remaining > 0 {
             let mut len_buf = [0u8; 4];
@@ -235,31 +242,36 @@ impl ConnectionPool {
                             .open(full_path.with_extension("part"))?;
                         current_file = Some(f);
                         current_file_path = Some(rel_path_str);
+                        current_hasher = Some(blake3::Hasher::new());
                     }
 
                     if let Some(file) = current_file.as_mut() {
                         file.write_all(&chunk.data)?;
                     }
+                    if let Some(hasher) = current_hasher.as_mut() {
+                        hasher.update(&chunk.data);
+                    }
 
                     if chunk.is_last {
+                        let hash_str = current_hasher.take().map(|h| h.finalize().to_hex().to_string());
                         current_file = None;
                         current_file_path = None;
 
-                        let part_path = full_path.with_extension("part");
-                        fs::rename(&part_path, &full_path)?;
-
-                        println!("Synced: {:?}", chunk.rel_path);
-                        let event = FileEvent::new(EventOp::Create, chunk.rel_path, None)
+                        let event = FileEvent::new(EventOp::Create, chunk.rel_path.clone(), hash_str)
                             .with_origin("network".to_string());
                         let _ = tx.send(event).await;
 
+                        let part_path = full_path.with_extension("part");
+                        fs::rename(&part_path, &full_path)?;
+                        
+                        println!("Synced: {:?}", chunk.rel_path);
                         files_remaining -= 1;
                     }
                 }
                 _ => {}
             }
         }
-        self.store_stream(addr, stream).await;
+        // self.store_stream(addr, stream).await;
         Ok(())
     }
 
@@ -272,26 +284,26 @@ impl ConnectionPool {
         stream.write_all(&serialized).await?;
 
         if matches!(event.operation(), EventOp::Create | EventOp::Modify) {
-            let (reader, mut writer) = stream.into_split();
+            let (_reader, mut writer) = stream.into_split();
 
             stream_file_to_writer(&mut writer, root_path, event.file_path()).await?;
 
-            let reunited_stream = reader.reunite(writer).unwrap();
-            stream = reunited_stream;
+            // let reunited_stream = reader.reunite(writer).unwrap();
+            // stream = reunited_stream;
 
             println!("Sent: {:?}", event.file_path());
         }
-        self.store_stream(addr, stream).await;
+        // self.store_stream(addr, stream).await;
         Ok(())
     }
 
     async fn acquire_stream(&self, addr: &str) -> anyhow::Result<TcpStream> {
-        if let Some(stream) = {
-            let mut guard = self.streams.lock().await;
-            guard.remove(addr)
-        } {
-            return Ok(stream);
-        }
+        // if let Some(stream) = {
+        //     let mut guard = self.streams.lock().await;
+        //     guard.remove(addr)
+        // } {
+        //     return Ok(stream);
+        // }
 
         // add timeout to prevent freezing on one event
         let connect_future = TcpStream::connect(addr);
@@ -336,10 +348,10 @@ impl ConnectionPool {
         bail!("Handshake failed with {}", addr)
     }
 
-    async fn store_stream(&self, addr: &str, stream: TcpStream) {
-        let mut guard = self.streams.lock().await;
-        guard.insert(addr.to_string(), stream);
-    }
+    // async fn store_stream(&self, addr: &str, stream: TcpStream) {
+    //     let mut guard = self.streams.lock().await;
+    //     guard.insert(addr.to_string(), stream);
+    // }
 }
 
 // helpers
@@ -356,7 +368,7 @@ async fn send_msg(writer: &mut tokio::net::tcp::OwnedWriteHalf, msg: &TransferMs
 async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, root: &PathBuf, rel_path: &PathBuf) -> anyhow::Result<()> {
     let full_path = root.join(rel_path);
     if let Ok(mut file) = fs::File::open(&full_path) {
-        let mut buffer = [0u8; CHUNK_SIZE];
+        let mut buffer = vec![0u8; CHUNK_SIZE];
         loop {
             let bytes_read = file.read(&mut buffer)?;
             if bytes_read == 0 { break; }
