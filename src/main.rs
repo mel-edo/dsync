@@ -112,9 +112,11 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("Sync failed with {}: {:?}", peer_addr, e);
                 } else {
                     if verbose { println!("Sync check complete with {}", peer_addr); }
+
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
                     let mut complete = sync_complete.lock().await;
                     if !*complete {
-                        // tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         *complete = true;
                         println!("✓ Initial sync complete, file watcher now active");
                     }
