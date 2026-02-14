@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use clap::Parser;
 use blake3::Hash;
-use tokio::{sync::{mpsc, Mutex}, io::AsyncReadExt};
+use tokio::{sync::{mpsc, Mutex}, io::{AsyncReadExt, AsyncWriteExt}, signal, time::{timeout, Duration}};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
@@ -243,7 +243,59 @@ async fn main() -> anyhow::Result<()> {
                 }
         });
     }
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(3000)).await;
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            println!("\n Shutting down...");
+
+            // get all peers
+            let mut peers = Vec::new();
+            if let Some(ref peer) = peer_addr {
+                peers.push(peer.clone());
+            }
+            if let Some(ref discovery) = peer_discovery {
+                peers.extend(discovery.get_peers().await);
+            }
+
+            // notify each peer
+            for peer in &peers {
+                println!("Notifying peer: {}", peer);
+
+                let notify = async {
+                    if let Ok(mut stream) = tokio::net::TcpStream::connect(peer).await {
+                        let msg = protocol::TransferMsg::Goodbye;
+                        if let Ok(serialized) = bincode::serialize(&msg) {
+                            stream.write_all(&(serialized.len() as u32).to_be_bytes()).await?;
+                            stream.write_all(&serialized).await?;
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
+                };
+                let _ = timeout(Duration::from_secs(2), notify).await;
+            }
+
+            // clean up .part files
+            println!("Cleaning up temporary files...");
+            cleanup_part_files(&folder_path, verbose).await;
+
+            println!("Cleanup complete, Goodbye!");
+            std::process::exit(0);
+        }
+    }
+}
+
+async fn cleanup_part_files(path: &std::path::Path, verbose: bool) {
+    use walkdir::WalkDir;
+
+    for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("part") {
+            if let Err(e) = std::fs::remove_file(path) {
+                if verbose {
+                    eprintln!("Failed to remove file {:?}: {}", path, e);
+                }
+            } else if verbose {
+                println!("Removed: {:?}", path);
+            }
+        }
     }
 }

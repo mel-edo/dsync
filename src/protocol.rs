@@ -19,6 +19,7 @@ pub enum TransferMsg {
     IndexRequest,
     IndexResponse(Vec<FileInfo>),
     RequestFile(String),
+    Goodbye,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -189,6 +189,10 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                     }
                                 }
                             }
+                        },
+                        TransferMsg::Goodbye => {
+                            if verbose { println!("Peer disconnected gracefully"); }
+                            break;
                         }
                     },
                     Err(_) => break,
