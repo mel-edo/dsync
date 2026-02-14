@@ -11,6 +11,7 @@ use crate::{
     watcher::watch_folder,
 };
 
+mod progress;
 mod event;
 mod network;
 mod sync;
@@ -72,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
     let last_hashes: Arc<Mutex<HashMap<PathBuf, Hash>>> = Arc::new(Mutex::new(HashMap::<PathBuf, Hash>::new()));
     let connection_pool = Arc::new(ConnectionPool::new(keypair));
 
+    let initial_sync_complete = Arc::new(Mutex::new(false));
     // setup mdns discovery
     let peer_discovery = if !args.no_discovery {
         let discovery = discovery::PeerDiscovery::new(my_id_hex)?;
@@ -98,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         let pool = Arc::clone(&connection_pool);
         let folder = folder_path.clone();
         let tx_clone = tx.clone();
+        let sync_complete = Arc::clone(&initial_sync_complete);
 
         tokio::spawn(async move {
             while let Some(peer_addr) = peer_rx.recv().await {
@@ -109,6 +112,12 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("Sync failed with {}: {:?}", peer_addr, e);
                 } else {
                     if verbose { println!("Sync check complete with {}", peer_addr); }
+                    let mut complete = sync_complete.lock().await;
+                    if !*complete {
+                        // tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        *complete = true;
+                        println!("✓ Initial sync complete, file watcher now active");
+                    }
                 }
             }
         });
@@ -122,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
         let peer_discovery = peer_discovery.clone();
         let last_hashes = Arc::clone(&last_hashes);
         let instance_id = instance_id.clone();
+        let initial_sync_complete = Arc::clone(&initial_sync_complete);
 
         tokio::spawn(async move {
             while let Some(mut event) = rx.recv().await {
@@ -140,12 +150,42 @@ async fn main() -> anyhow::Result<()> {
                         let hash = hasher.finalize();
                         let mut map = last_hashes.lock().await;
                         map.insert(event.file_path().clone(), hash);
+
+                        if verbose {
+                            println!("Stored hash for network file: {:?} -> {}", event.file_path(), hash.to_hex());
+                        }
                     }
     
                     continue;
                 }
+
+                // skip watcher events during initial sync phase
+                {
+                    let sync_done = initial_sync_complete.lock().await;
+                    if !*sync_done {
+                        if verbose {
+                            println!("Skipping watcher event during initial sync: {:?}", event.file_path());
+                        }
+                        continue;
+                    }
+                }
+
+                if matches!(event.operation(), EventOp::Delete) {
+                    if let Some(parent) = event.file_path().parent() {
+                        if !parent.as_os_str().is_empty() {
+                            let parent_full = folder_path.join(parent);
+                            if !parent_full.exists() {
+                                if verbose {
+                                    println!("Skipping file deletion {:?} (parent directory deleted)", event.file_path());
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
     
                 if verbose { println!("Got FileEvent in main: {:?}", event); }
+
                 let current_hash = if matches!(event.operation(), EventOp::Delete) {
                     None
                 } else {
@@ -170,7 +210,12 @@ async fn main() -> anyhow::Result<()> {
                     match current_hash {
                         Some(hash) => {
                             if let Some(prev_hash) = map.get(event.file_path().as_path()) {
-                                if *prev_hash == hash { continue; }
+                                if *prev_hash == hash {
+                                    if verbose {
+                                        println!("Skipping duplicated: {:?} (hash unchanged)", event.file_path());
+                                    }
+                                    continue;
+                                }
                             }
                             map.insert(event.file_path().clone(), hash);
                         }

@@ -6,6 +6,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
 use crate::{protocol::{HandshakeMsg, TransferMsg}, util, sync};
 use blake3;
+use crate::progress::ProgressManager;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 
@@ -36,6 +37,9 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
             let mut current_file: Option<std::fs::File> = None;
             let mut current_hasher: Option<blake3::Hasher> = None;
             let mut pending_transfers: HashMap<PathBuf, Instant> = HashMap::new();
+
+            let progress_manager = Some(ProgressManager::new());
+            let mut active_progress = None;
 
             loop {
                 let mut len_buf = [0u8; 4];
@@ -77,7 +81,7 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                             send_msg(&mut writer, &TransferMsg::Event(event)).await.ok();
 
                             // stream the file content using helper
-                            if let Err(e) = stream_file_to_writer(&mut writer, &root_clone, &file_path).await {
+                            if let Err(e) = stream_file_to_writer(&mut writer, &root_clone, &file_path, None).await {
                                 eprintln!("Failed to stream file {}: {:?}", path, e);
                             }
                         },
@@ -92,13 +96,33 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                             match event.operation() {
                                 EventOp::Delete => {
                                     let full_path = root_clone.join(event.file_path());
-                                    if full_path.exists() { let _ = fs::remove_file(&full_path); }
-                                    println!("Deleted: {:?}", event.file_path());
+
+                                    if full_path.exists() {
+                                        if full_path.is_dir() {
+                                            match fs::remove_dir_all(&full_path) {
+                                                Ok(_) => println!("Deleted directory: {:?}", event.file_path()),
+                                                Err(e) => eprintln!("Failed to delete directory {:?}: {}", event.file_path(), e),
+                                            }
+                                        } else {
+                                            match fs::remove_file(&full_path) {
+                                                Ok(_) => println!("Deleted: {:?}", event.file_path()),
+                                                Err(_) => {}
+                                            }
+                                        }
+                                    }
                                     let _ = tx.send(event).await;
                                 }
                                 EventOp::Create | EventOp::Modify => {
                                     let full_path = root_clone.join(event.file_path());
                                     util::ensure_parent(&full_path).ok();
+
+                                    if let Some(ref pm) = progress_manager {
+                                        let file_name = event.file_path()
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("unknown");
+                                        active_progress = Some(pm.create_spinner(&format!("Receiving: {}", file_name)));
+                                    }
                                 }
                             }
                         },
@@ -127,6 +151,14 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                 if let Err(e) = file.write_all(&chunk.data) {
                                     eprintln!("Write error: {:?}", e);
                                     current_file = None;
+                                } else {
+                                    if let Some(ref pb) = active_progress {
+                                        let file_name = chunk.rel_path
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("unknown");
+                                        pb.set_message(format!("Receiving: {}: {} bytes", file_name, chunk.offset + chunk.data.len() as u64));
+                                    }
                                 }
                             }
                             if let Some(hasher) = current_hasher.as_mut() {
@@ -149,7 +181,12 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                     } else {
                                         "??s".to_string()
                                     };
-                                    println!("Received: {:?} ({})", chunk.rel_path, duration);
+
+                                    if let Some(pb) = active_progress.take() {
+                                        pb.finish_with_message(format!("✓ Received: {} ({})", chunk.rel_path.display(), duration));
+                                    } else {
+                                        println!("Received: {:?} ({})", chunk.rel_path, duration);
+                                    }
                                 }
                             }
                         }
@@ -164,6 +201,7 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
 pub struct ConnectionPool {
     // streams: Mutex<HashMap<String, TcpStream>>,
     my_keypair: Arc<SigningKey>,
+    progress_manager: Option<Arc<ProgressManager>>,
 }
 
 impl ConnectionPool {
@@ -171,6 +209,7 @@ impl ConnectionPool {
         Self {
             // streams: Mutex::new(HashMap::new()),
             my_keypair: Arc::new(keypair),
+            progress_manager: Some(Arc::new(ProgressManager::new()))
         }
     }
 
@@ -203,6 +242,21 @@ impl ConnectionPool {
             return Ok(());
         }
         println!("Syncing {} missing files from {}", missing_files.len(), addr);
+
+        let mut file_progress_bars = HashMap::new();
+
+        if let Some(ref pm) = self.progress_manager {
+            for path in &missing_files {
+                if let Some(file_info) = remote_index.iter().find(|f| f.path == *path) {
+                    let file_name = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(path);
+                    let pb = pm.create_receive_progress(file_name, file_info.size);
+                    file_progress_bars.insert(path.clone(), pb);
+                }
+            }
+        }
 
         let mut stream = reader.into_inner();
 
@@ -241,7 +295,7 @@ impl ConnectionPool {
                         let f = fs::OpenOptions::new().write(true).create(true).append(true)
                             .open(full_path.with_extension("part"))?;
                         current_file = Some(f);
-                        current_file_path = Some(rel_path_str);
+                        current_file_path = Some(rel_path_str.clone());
                         current_hasher = Some(blake3::Hasher::new());
                     }
 
@@ -250,6 +304,10 @@ impl ConnectionPool {
                     }
                     if let Some(hasher) = current_hasher.as_mut() {
                         hasher.update(&chunk.data);
+                    }
+
+                    if let Some(pb) = file_progress_bars.get(&rel_path_str) {
+                        pb.set_position(chunk.offset + chunk.data.len() as u64);
                     }
 
                     if chunk.is_last {
@@ -263,8 +321,12 @@ impl ConnectionPool {
 
                         let part_path = full_path.with_extension("part");
                         fs::rename(&part_path, &full_path)?;
-                        
-                        println!("Synced: {:?}", chunk.rel_path);
+
+                        if let Some(pb) = file_progress_bars.remove(&rel_path_str) {
+                            pb.finish_with_message(format!("✓ Synced"));
+                        } else {
+                            println!("Synced: {:?}", chunk.rel_path);
+                        }
                         files_remaining -= 1;
                     }
                 }
@@ -286,12 +348,28 @@ impl ConnectionPool {
         if matches!(event.operation(), EventOp::Create | EventOp::Modify) {
             let (_reader, mut writer) = stream.into_split();
 
-            stream_file_to_writer(&mut writer, root_path, event.file_path()).await?;
+            let progress = if let Some(ref pm) = self.progress_manager {
+                let full_path = root_path.join(event.file_path());
+                if let Ok(metadata) = std::fs::metadata(&full_path) {
+                    let file_size = metadata.len();
+                    let file_name = event.file_path().file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown");
+                    Some(pm.create_transfer_progress(file_name, file_size))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            stream_file_to_writer(&mut writer, root_path, event.file_path(), progress).await?;
 
             // let reunited_stream = reader.reunite(writer).unwrap();
             // stream = reunited_stream;
-
-            println!("Sent: {:?}", event.file_path());
+            if self.progress_manager.is_none() {
+                println!("Sent: {:?}", event.file_path());
+            }
         }
         // self.store_stream(addr, stream).await;
         Ok(())
@@ -365,23 +443,40 @@ async fn send_msg(writer: &mut tokio::net::tcp::OwnedWriteHalf, msg: &TransferMs
 }
 
 // helper to chunk and stream a file
-async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, root: &PathBuf, rel_path: &PathBuf) -> anyhow::Result<()> {
+async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, root: &PathBuf, rel_path: &PathBuf, progress: Option<indicatif::ProgressBar>) -> anyhow::Result<()> {
     let full_path = root.join(rel_path);
+
     if let Ok(mut file) = fs::File::open(&full_path) {
+        let file_size = file.metadata()?.len();
+
+        if let Some(ref pb) = progress {
+            pb.set_length(file_size);
+        }
+
         let mut buffer = vec![0u8; CHUNK_SIZE];
+        let mut total_sent = 0u64;
+
         loop {
             let bytes_read = file.read(&mut buffer)?;
             if bytes_read == 0 { break; }
 
             let chunk = FileChunk {
                 rel_path: rel_path.clone(),
-                offset: 0,
+                offset: total_sent,
                 data: buffer[..bytes_read].to_vec(),
                 is_last: bytes_read < CHUNK_SIZE,
             };
-
             let chunk_msg = TransferMsg::Chunk(chunk);
             send_msg(writer, &chunk_msg).await?;
+
+            total_sent += bytes_read as u64;
+
+            if let Some(ref pb) = progress {
+                pb.set_position(total_sent);
+            }
+        }
+        if let Some(pb) = progress {
+            pb.finish_with_message(format!("✓ Sent"));
         }
     }
     Ok(())
