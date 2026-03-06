@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fs, io::{Read, Write}, path::PathBuf, sync::Arc, time::Instant};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::{TcpListener, TcpStream}, sync::mpsc, time::{timeout, Duration}};
 use anyhow::{Context, bail};
-use crate::event::{EventOp, FileEvent, FileChunk};
+use crate::{event::{EventOp, FileChunk, FileEvent}, ignore::IgnoreList};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
 use crate::{protocol::{HandshakeMsg, TransferMsg}, util, sync};
@@ -12,7 +12,7 @@ use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 
-pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEvent>, instance_id: String) -> anyhow::Result<()> {
+pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEvent>, instance_id: String, ignore: Arc<IgnoreList>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     info!("Server listening on port {}", port);
 
@@ -24,6 +24,7 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
         let tx = sender.clone();
         let root_clone = root.clone();
         let instance_id_clone = instance_id.clone();
+        let ignore_clone = Arc::clone(&ignore);
 
         tokio::spawn(async move {
             if let Err(e) = perform_server_handshake(&mut stream).await {
@@ -57,14 +58,14 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                     Ok(msg) => match msg {
                         TransferMsg::IndexRequest => {
                             debug!("Received Index Request");
-                            let index = sync::generate_local_index(&root_clone);
+                            let index = sync::generate_local_index(&root_clone, &ignore_clone);
                             send_msg(&mut writer, &TransferMsg::IndexResponse(index)).await.ok();
                         },
 
                         // peer sent us their list
                         TransferMsg::IndexResponse(remote_index) => {
                             debug!("Received Remote Index ({} files)", remote_index.len());
-                            let local_index = sync::generate_local_index(&root_clone);
+                            let local_index = sync::generate_local_index(&root_clone, &ignore_clone);
                             let missing = sync::calculate_diff(&local_index, &remote_index);
 
                             for path in missing {
@@ -220,14 +221,16 @@ pub struct ConnectionPool {
     // streams: Mutex<HashMap<String, TcpStream>>,
     my_keypair: Arc<SigningKey>,
     progress_manager: Option<Arc<ProgressManager>>,
+    ignore: Arc<IgnoreList>,
 }
 
 impl ConnectionPool {
-    pub fn new(keypair: SigningKey) -> Self {
+    pub fn new(keypair: SigningKey, ignore: Arc<IgnoreList>) -> Self {
         Self {
             // streams: Mutex::new(HashMap::new()),
             my_keypair: Arc::new(keypair),
-            progress_manager: Some(Arc::new(ProgressManager::new()))
+            progress_manager: Some(Arc::new(ProgressManager::new())),
+            ignore,
         }
     }
 
@@ -252,7 +255,7 @@ impl ConnectionPool {
             _ => bail!("Expected IndexResponse"),
         };
 
-        let local_index = sync::generate_local_index(&root);
+        let local_index = sync::generate_local_index(&root, &self.ignore);
         let missing_files = sync::calculate_diff(&local_index, &remote_index);
 
         if missing_files.is_empty() {
@@ -524,8 +527,6 @@ async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, roo
             };
             let chunk_msg = TransferMsg::Chunk(chunk);
             send_msg(writer, &chunk_msg).await?;
-
-            total_sent += bytes_read as u64;
 
             if let Some(ref pb) = progress {
                 pb.set_position(total_sent);

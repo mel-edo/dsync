@@ -5,6 +5,7 @@ use tokio::{sync::{mpsc, Mutex}, io::AsyncReadExt, signal};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use tracing::{debug, error, info, warn};
+use ignore::IgnoreList;
 
 use crate::{
     event::EventOp,
@@ -19,6 +20,7 @@ mod sync;
 mod util;
 mod watcher;
 mod discovery;
+mod ignore;
 pub mod protocol;
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -75,6 +77,10 @@ struct Args {
     /// Show detailed connection logs
     #[arg(short = 'v', long, default_value_t = false)]
     verbose: bool,
+
+    /// Exclude patterns (e.g. --exclude "*.log" -- exclude "build/")
+    #[arg(short = 'e', long, num_args = 0..)]
+    exclude: Vec<String>,
 }
 
 #[tokio::main]
@@ -108,16 +114,17 @@ async fn main() -> anyhow::Result<()> {
     info!("Ephemeral ID: {}", &my_id_hex[..16]);
 
     let folder_path = PathBuf::from(path);
+    let ignore_list = Arc::new(IgnoreList::load(&folder_path, &args.exclude));
     let port = port;
     let peer_addr = peer;
     let instance_id = my_id_hex.clone();
 
     let (tx, mut rx) = mpsc::channel(100);
     let (peer_tx, mut peer_rx) = mpsc::channel(100);
-    let _watcher = watch_folder(folder_path.clone(), tx.clone()).await?;
+    let _watcher = watch_folder(folder_path.clone(), tx.clone(), Arc::clone(&ignore_list)).await?;
 
     let last_hashes: Arc<Mutex<HashMap<PathBuf, Hash>>> = Arc::new(Mutex::new(HashMap::<PathBuf, Hash>::new()));
-    let connection_pool = Arc::new(ConnectionPool::new(keypair));
+    let connection_pool = Arc::new(ConnectionPool::new(keypair, Arc::clone(&ignore_list)));
 
     let initial_sync_complete = Arc::new(Mutex::new(false));
     // setup mdns discovery
@@ -136,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
         let folder_clone = folder_path.clone();
         let instance_id_clone = instance_id.clone();
         async move {
-            if let Err(e) = network::start_server(port, folder_clone, tx_clone, instance_id_clone).await {
+            if let Err(e) = network::start_server(port, folder_clone, tx_clone, instance_id_clone, Arc::clone(&ignore_list)).await {
                 error!("Server error: {:?}", e);
             }
         }
