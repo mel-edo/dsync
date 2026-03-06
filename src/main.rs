@@ -21,12 +21,40 @@ mod watcher;
 mod discovery;
 pub mod protocol;
 
+#[derive(Debug, serde::Deserialize, Default)]
+struct Config {
+    path: Option<String>,
+    port: Option<u16>,
+    peer: Option<String>,
+    name: Option<String>,
+    no_discovery: Option<bool>,
+}
+
+fn load_config() -> Config {
+    let config_path = dirs::config_dir()
+        .map(|d| d.join("dsync").join("dsync.toml"))
+        .filter(|p| p.exists());
+
+    let config_path = match config_path {
+        Some(p) => p,
+        None => return Config::default(),
+    };
+
+    match std::fs::read_to_string(&config_path) {
+        Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
+            warn!("Failed to parse {:?}: {}", config_path, e);
+            Config::default()
+        }),
+        Err(_) => Config::default(),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Folder path to sync
     #[arg(short = 'd', long)]
-    path: String,
+    path: Option<String>,
 
     /// Port to listen on (default: 9000)
     #[arg(short = 'p', long, default_value_t = 9000)]
@@ -53,6 +81,14 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    let config = load_config();
+
+    let path = args.path.or(config.path).expect("No sync folder specified. Use -d or set 'path' in dsync.toml");
+    let port = if args.port != 9000 { args.port } else { config.port.unwrap_or(args.port) };
+    let peer = args.peer.or(config.peer);
+    let name = if args.name != "dsync-instance" { args.name } else { config.name.unwrap_or(args.name) };
+    let no_discovery = args.no_discovery || config.no_discovery.unwrap_or(false);
+
     let log_level = if args.verbose {
         tracing::Level::DEBUG
     } else {
@@ -71,9 +107,9 @@ async fn main() -> anyhow::Result<()> {
     let my_id_hex = hex::encode(my_public_key);
     info!("Ephemeral ID: {}", &my_id_hex[..16]);
 
-    let folder_path = PathBuf::from(args.path);
-    let port = args.port;
-    let peer_addr = args.peer;
+    let folder_path = PathBuf::from(path);
+    let port = port;
+    let peer_addr = peer;
     let instance_id = my_id_hex.clone();
 
     let (tx, mut rx) = mpsc::channel(100);
@@ -85,9 +121,9 @@ async fn main() -> anyhow::Result<()> {
 
     let initial_sync_complete = Arc::new(Mutex::new(false));
     // setup mdns discovery
-    let peer_discovery = if !args.no_discovery {
+    let peer_discovery = if !no_discovery {
         let discovery = discovery::PeerDiscovery::new(my_id_hex)?;
-        discovery.register_service(port, &args.name)?;
+        discovery.register_service(port, &name)?;
         discovery.start_browsing(peer_tx).await?;
         Some(Arc::new(discovery))
     } else {
