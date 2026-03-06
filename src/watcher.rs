@@ -1,84 +1,134 @@
-use std::{io::ErrorKind, path::PathBuf};
+use std::{collections::HashMap, path::{PathBuf, Path}, sync::Arc, time::Instant};
 use pathdiff::diff_paths;
-use tokio::{fs, sync::mpsc};
-use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher, Error};
+use tokio::{fs::File, sync::{mpsc, Mutex}, io::AsyncReadExt};
+use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use crate::event::{FileEvent, EventOp};
-use blake3;
+use blake3::Hasher;
+
+const HASH_BUFFER_SIZE: usize = 64 * 1024;
 
 pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> notify::Result<RecommendedWatcher> {
-    let tx = sender.clone();
+    let root = root.canonicalize().unwrap_or(root);
+    let debounce_map: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let handle = tokio::runtime::Handle::current();
-    let root_for_watcher = root.clone();
+
+    let root_clone = root.clone();
+    let sender_clone = sender.clone();
+    let debounce_clone = debounce_map.clone();
 
     let mut file_watcher = RecommendedWatcher::new(
-        move |res: Result<Event, Error>| {
-            let root = root_for_watcher.clone();
+        move |res: notify::Result<Event>| {
+            let root = root_clone.clone();
+            let tx = sender_clone.clone();
+            let debounce = debounce_clone.clone();
             let handle = handle.clone();
 
-            match res {
-                Ok(event) => {
-                    let operation = match event.kind {
-                        notify::EventKind::Create(_) => EventOp::Create,
-                        notify::EventKind::Modify(_) => EventOp::Modify,
-                        notify::EventKind::Remove(_) => EventOp::Delete,
-                        _ => return,
-                    };
+            if let Ok(event) = res {
+                if event.paths.is_empty() {
+                    return;
+                }
+                let path = event.paths[0].clone();
+            
+                // ignore .part files
+                if path.extension().map(|e| e == "part").unwrap_or(false) {
+                    return;
+                }
 
-                    if event.paths.is_empty() { return; }
-                    let absolute_path = event.paths[0].clone();
+                let root = root.clone();
 
-                    // ignore .part files
-                    if let Some(ext) = absolute_path.extension() {
-                        if ext == "part" { return; }
-                    }
-
-                    // resolve paths
-                    let canonical_root = match root.canonicalize() {
-                        Ok(p) => p,
-                        Err(_) => root.clone(),
-                    };
-                    let relative_path = match diff_paths(&absolute_path, &canonical_root) {
-                        Some(p) => p,
-                        None => match diff_paths(&absolute_path, &root) {
-                            Some(p) => p,
-                            None => return,
+                handle.spawn(async move {
+                    // debounce per file
+                    let should_process = {
+                        let mut map = debounce.lock().await;
+                        if let Some(&last_time) = map.get(&path) {
+                            if last_time.elapsed() < std::time::Duration::from_secs(2) {
+                                false
+                            } else {
+                                map.insert(path.clone(), Instant::now());
+                                true
+                            }
+                        } else {
+                            map.insert(path.clone(), Instant::now());
+                            true
                         }
                     };
 
-                    let tx2 = tx.clone();
-                    let op = operation.clone();
+                    if !should_process {
+                        return;
+                    }
 
-                    handle.spawn(async move {
+                    let _ = async {
 
-                        // debounce to wait for write to finish
-                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-                        let file_event = match op {
-                            EventOp::Delete => FileEvent::new(EventOp::Delete, relative_path, None),
-                            _ => {
-                                match fs::read(&absolute_path).await {
-                                    Ok(bytes) => {
-                                        let hash = blake3::hash(&bytes).to_hex().to_string();
-                                        FileEvent::new(op, relative_path, Some(hash))
-                                    }
-                                    Err(e) => {
-                                        if e.kind() == ErrorKind::NotFound {
-                                            FileEvent::new(EventOp::Delete, relative_path, None)
-                                        } else {
-                                            eprintln!("Error reading file: {:?}", e);
-                                            return;
+                        let relative = match diff_paths(&path, &root) {
+                            Some(p) => p,
+                            None => return,
+                        };
+        
+                        match tokio::fs::metadata(&path).await {
+                            Ok(meta) => {
+                                if meta.is_dir() {
+                                    return;
+                                }
+        
+                                let mut last_size = meta.len();
+                                let mut last_modified = meta.modified().ok();
+        
+                                loop {
+                                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        
+                                    match tokio::fs::metadata(&path).await {
+                                        Ok(new_meta) => {
+                                            let new_size = new_meta.len();
+                                            let new_modified = new_meta.modified().ok();
+        
+                                            if new_size == last_size && new_modified == last_modified {
+                                                break;
+                                            }
+        
+                                            last_size = new_size;
+                                            last_modified = new_modified;
                                         }
+                                        Err(_) => return,
                                     }
                                 }
+        
+                                match hash_file(&path).await {
+                                    Ok(hash) => {
+                                        let event = FileEvent::new(EventOp::Modify, relative, Some(hash));
+                                        let _ = tx.send(event).await;
+                                    }
+                                    Err(_) => {}
+                                }
                             }
-                        };
-                        let _ = tx2.send(file_event).await;
-                    });
-                },
-                Err(e) => println!("Watch error: {:?}", e),
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::NotFound {
+                                    let event = FileEvent::new(EventOp::Delete, relative, None);
+                                    let _ = tx.send(event).await;
+                                }
+                            }
+                        }
+                    }
+                    .await;
+                });
             }
-        }, Config::default())?;
-
-    file_watcher.watch(root.as_path(), RecursiveMode::Recursive)?;
+        },
+        Config::default(),
+    )?;
+    file_watcher.watch(&root, RecursiveMode::Recursive)?;
     Ok(file_watcher)
+}
+
+async fn hash_file(path: &Path) -> anyhow::Result<String> {
+    let mut file = File::open(path).await?;
+    let mut hasher = Hasher::new();
+    let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
+
+    loop {
+        let n = file.read(&mut buffer).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }

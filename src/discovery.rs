@@ -1,7 +1,8 @@
 use mdns_sd::{ServiceDaemon, ServiceInfo, ServiceEvent};
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use get_if_addrs::get_if_addrs;
+use tracing::info;
 
 const SERVICE_TYPE: &str = "_dsync._tcp.local.";
 
@@ -52,12 +53,12 @@ impl PeerDiscovery {
         )?.enable_addr_auto();
 
         self.daemon.register(service_info)?;
-        println!("Discovery Active: {} (Port {})", instance_name, port);
+        info!("Discovery Active: {} (Port {})", instance_name, port);
         Ok(())
     }
 
     // Start browsing for other dsync instances
-    pub async fn start_browsing(&self) -> anyhow::Result<()> {
+    pub async fn start_browsing(&self, notify_tx: mpsc::Sender<String>) -> anyhow::Result<()> {
         let receiver = self.daemon.browse(SERVICE_TYPE)?;
         let peers = Arc::clone(&self.peers);
         let my_id = self.my_id.clone();
@@ -82,8 +83,9 @@ impl PeerDiscovery {
                         for addr in addresses {
                             if addr.is_ipv4() {
                                 let peer_addr = format!("{}:{}", addr, port);
-                                println!("Discovered peer: {} ({})", instance_name, peer_addr);
-                                peers_map.insert(instance_name.clone(), peer_addr);
+                                info!("Discovered peer: {} ({})", instance_name, peer_addr);
+                                peers_map.insert(instance_name.clone(), peer_addr.clone());
+                                let _ = notify_tx.send(peer_addr).await;
                                 break;
                             }
                         }
@@ -91,7 +93,7 @@ impl PeerDiscovery {
                     ServiceEvent::ServiceRemoved(_, fullname) => {
                         let mut peers_map = peers.lock().await;
                         if peers_map.remove(&fullname).is_some() {
-                            println!("Peer left: {}", fullname);
+                            info!("Peer left: {}", fullname);
                         }
                     }
                     _ => {}
