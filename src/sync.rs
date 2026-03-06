@@ -1,4 +1,5 @@
 use std::{fs, path::Path, time::UNIX_EPOCH};
+use tracing::debug;
 use walkdir::WalkDir;
 use crate::protocol::FileInfo;
 
@@ -50,12 +51,12 @@ pub fn calculate_diff(local: &[FileInfo], remote: &[FileInfo]) -> Vec<String> {
         match match_found {
             Some(local_file) => {
                 if local_file.size != remote_file.size || local_file.modified < remote_file.modified {
-                    println!("Outdated: {} (Size: {} vs {}, Time: {} vs {})", remote_file.path, local_file.size, remote_file.size, local_file.modified, remote_file.modified); // optional log
+                    debug!("Outdated: {} (Size: {} vs {}, Time: {} vs {})", remote_file.path, local_file.size, remote_file.size, local_file.modified, remote_file.modified); // optional log
                     missing_files.push(remote_file.path.clone());
                 }
             },
             None => {
-                println!("Missing: {}", remote_file.path); // optional log
+                debug!("Missing: {}", remote_file.path); // optional log
                 missing_files.push(remote_file.path.clone());
             }
         }

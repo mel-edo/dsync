@@ -1,9 +1,10 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use clap::Parser;
 use blake3::Hash;
-use tokio::{sync::{mpsc, Mutex}, io::{AsyncReadExt, AsyncWriteExt}, signal, time::{timeout, Duration}};
+use tokio::{sync::{mpsc, Mutex}, io::AsyncReadExt, signal};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use tracing::{debug, error, info, warn};
 
 use crate::{
     event::EventOp,
@@ -51,7 +52,16 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let verbose = args.verbose;
+
+    let log_level = if args.verbose {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::INFO
+    };
+    tracing_subscriber::fmt()
+        .with_max_level(log_level)
+        .with_target(false)
+        .init();
 
     // generate ephemeral identity
     let mut csprng = OsRng{};
@@ -59,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
     let my_public_key = keypair.verifying_key().to_bytes();
 
     let my_id_hex = hex::encode(my_public_key);
-    println!("Ephemeral ID: {}", my_id_hex);
+    info!("Ephemeral ID: {}", &my_id_hex[..16]);
 
     let folder_path = PathBuf::from(args.path);
     let port = args.port;
@@ -90,8 +100,8 @@ async fn main() -> anyhow::Result<()> {
         let folder_clone = folder_path.clone();
         let instance_id_clone = instance_id.clone();
         async move {
-            if let Err(e) = network::start_server(port, folder_clone, tx_clone, instance_id_clone, verbose).await {
-                eprintln!("Server error: {:?}", e);
+            if let Err(e) = network::start_server(port, folder_clone, tx_clone, instance_id_clone).await {
+                error!("Server error: {:?}", e);
             }
         }
     });
@@ -106,19 +116,19 @@ async fn main() -> anyhow::Result<()> {
             while let Some(peer_addr) = peer_rx.recv().await {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-                if verbose { println!("Initiating sync with {}", peer_addr); }
+                debug!("Initiating sync with {}", peer_addr);
 
                 if let Err(e) = pool.request_index(&peer_addr, folder.clone(), tx_clone.clone()).await {
-                    eprintln!("Sync failed with {}: {:?}", peer_addr, e);
+                    error!("Sync failed with {}: {:?}", peer_addr, e);
                 } else {
-                    if verbose { println!("Sync check complete with {}", peer_addr); }
+                    debug!("Sync check complete with {}", peer_addr);
 
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
                     let mut complete = sync_complete.lock().await;
                     if !*complete {
                         *complete = true;
-                        println!("✓ Initial sync complete, file watcher now active");
+                        info!("✓ Initial sync complete, file watcher now active");
                     }
                 }
             }
@@ -153,9 +163,7 @@ async fn main() -> anyhow::Result<()> {
                         let mut map = last_hashes.lock().await;
                         map.insert(event.file_path().clone(), hash);
 
-                        if verbose {
-                            println!("Stored hash for network file: {:?} -> {}", event.file_path(), hash.to_hex());
-                        }
+                        debug!("Stored hash for network file: {:?} -> {}", event.file_path(), hash.to_hex());
                     }
     
                     continue;
@@ -165,9 +173,7 @@ async fn main() -> anyhow::Result<()> {
                 {
                     let sync_done = initial_sync_complete.lock().await;
                     if !*sync_done {
-                        if verbose {
-                            println!("Skipping watcher event during initial sync: {:?}", event.file_path());
-                        }
+                        debug!("Skipping watcher event during initial sync: {:?}", event.file_path());
                         continue;
                     }
                 }
@@ -177,16 +183,14 @@ async fn main() -> anyhow::Result<()> {
                         if !parent.as_os_str().is_empty() {
                             let parent_full = folder_path.join(parent);
                             if !parent_full.exists() {
-                                if verbose {
-                                    println!("Skipping file deletion {:?} (parent directory deleted)", event.file_path());
-                                }
+                                debug!("Skipping file deletion {:?} (parent directory deleted)", event.file_path());
                                 continue;
                             }
                         }
                     }
                 }
     
-                if verbose { println!("Got FileEvent in main: {:?}", event); }
+                debug!("Got FileEvent in main: {:?}", event);
 
                 let current_hash = if matches!(event.operation(), EventOp::Delete) {
                     None
@@ -213,9 +217,7 @@ async fn main() -> anyhow::Result<()> {
                         Some(hash) => {
                             if let Some(prev_hash) = map.get(event.file_path().as_path()) {
                                 if *prev_hash == hash {
-                                    if verbose {
-                                        println!("Skipping duplicated: {:?} (hash unchanged)", event.file_path());
-                                    }
+                                    debug!("Skipping duplicated: {:?} (hash unchanged)", event.file_path());
                                     continue;
                                 }
                             }
@@ -239,7 +241,7 @@ async fn main() -> anyhow::Result<()> {
 
                 for peer in peers {
                     if let Err(e) = connection_pool.send_event(&peer, &event, &folder_path).await {
-                        eprintln!("Failed to send event to {}: {:?}", peer, e);
+                        warn!("Failed to send event to {}: {:?}", peer, e);
                         }
                     }
                 }
@@ -247,56 +249,28 @@ async fn main() -> anyhow::Result<()> {
     }
     tokio::select! {
         _ = signal::ctrl_c() => {
-            println!("\n Shutting down...");
-
-            // get all peers
-            let mut peers = Vec::new();
-            if let Some(ref peer) = peer_addr {
-                peers.push(peer.clone());
-            }
-            if let Some(ref discovery) = peer_discovery {
-                peers.extend(discovery.get_peers().await);
-            }
-
-            // notify each peer
-            for peer in &peers {
-                println!("Notifying peer: {}", peer);
-
-                let notify = async {
-                    if let Ok(mut stream) = tokio::net::TcpStream::connect(peer).await {
-                        let msg = protocol::TransferMsg::Goodbye;
-                        if let Ok(serialized) = bincode::serialize(&msg) {
-                            stream.write_all(&(serialized.len() as u32).to_be_bytes()).await?;
-                            stream.write_all(&serialized).await?;
-                        }
-                    }
-                    Ok::<(), anyhow::Error>(())
-                };
-                let _ = timeout(Duration::from_secs(2), notify).await;
-            }
+            info!("\n Shutting down...");
 
             // clean up .part files
-            println!("Cleaning up temporary files...");
-            cleanup_part_files(&folder_path, verbose).await;
+            info!("Cleaning up temporary files...");
+            cleanup_part_files(&folder_path).await;
 
-            println!("Cleanup complete, Goodbye!");
+            info!("Cleanup complete, Goodbye!");
             std::process::exit(0);
         }
     }
 }
 
-async fn cleanup_part_files(path: &std::path::Path, verbose: bool) {
+async fn cleanup_part_files(path: &std::path::Path) {
     use walkdir::WalkDir;
 
     for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("part") {
             if let Err(e) = std::fs::remove_file(path) {
-                if verbose {
-                    eprintln!("Failed to remove file {:?}: {}", path, e);
-                }
-            } else if verbose {
-                println!("Removed: {:?}", path);
+                warn!("Failed to remove file {:?}: {}", path, e);
+            } else {
+                debug!("Removed: {:?}", path);
             }
         }
     }

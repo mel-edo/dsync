@@ -7,16 +7,17 @@ use rand::{RngCore, rngs::OsRng};
 use crate::{protocol::{HandshakeMsg, TransferMsg}, util, sync};
 use blake3;
 use crate::progress::ProgressManager;
+use tracing::{debug, error, info, warn};
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 
-pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEvent>, instance_id: String, verbose: bool) -> anyhow::Result<()> {
+pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEvent>, instance_id: String) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    if verbose { println!("Server listening on port {}", port); }
+    info!("Server listening on port {}", port);
 
     loop {
         let (mut stream, addr) = listener.accept().await?;
-        if verbose { println!("New connection from {:?}", addr); }
+        debug!("New connection from {:?}", addr);
 
         // spawn a new task with tokio::spawn to handle multiple peers
         let tx = sender.clone();
@@ -25,7 +26,7 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
 
         tokio::spawn(async move {
             if let Err(e) = perform_server_handshake(&mut stream).await {
-                eprintln!("Handshake failed: {:?}", e);
+                warn!("Handshake failed: {:?}", e);
                 return;
             }
 
@@ -54,26 +55,26 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                     // peer wants our file list
                     Ok(msg) => match msg {
                         TransferMsg::IndexRequest => {
-                            if verbose { println!("Received Index Request"); }
+                            debug!("Received Index Request");
                             let index = sync::generate_local_index(&root_clone);
                             send_msg(&mut writer, &TransferMsg::IndexResponse(index)).await.ok();
                         },
 
                         // peer sent us their list
                         TransferMsg::IndexResponse(remote_index) => {
-                            if verbose { println!("Received Remote Index ({} files)", remote_index.len()); }
+                            debug!("Received Remote Index ({} files)", remote_index.len());
                             let local_index = sync::generate_local_index(&root_clone);
                             let missing = sync::calculate_diff(&local_index, &remote_index);
 
                             for path in missing {
-                                if verbose { println!("Requesting: {}", path); }
+                                debug!("Requesting: {}", path);
                                 send_msg(&mut writer, &TransferMsg::RequestFile(path)).await.ok();
                             }
                         },
 
                         // peer requested a specific file, send it
                         TransferMsg::RequestFile(path) => {
-                            if verbose { println!("Sending requested file: {}", path); }
+                            debug!("Sending requested file: {}", path);
                             let file_path = PathBuf::from(&path);
 
                             // send metadata first
@@ -82,7 +83,7 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
 
                             // stream the file content using helper
                             if let Err(e) = stream_file_to_writer(&mut writer, &root_clone, &file_path, None).await {
-                                eprintln!("Failed to stream file {}: {:?}", path, e);
+                                error!("Failed to stream file {}: {:?}", path, e);
                             }
                         },
 
@@ -100,12 +101,12 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                     if full_path.exists() {
                                         if full_path.is_dir() {
                                             match fs::remove_dir_all(&full_path) {
-                                                Ok(_) => println!("Deleted directory: {:?}", event.file_path()),
-                                                Err(e) => eprintln!("Failed to delete directory {:?}: {}", event.file_path(), e),
+                                                Ok(_) => info!("Deleted directory: {:?}", event.file_path()),
+                                                Err(e) => error!("Failed to delete directory {:?}: {}", event.file_path(), e),
                                             }
                                         } else {
                                             match fs::remove_file(&full_path) {
-                                                Ok(_) => println!("Deleted: {:?}", event.file_path()),
+                                                Ok(_) => info!("Deleted: {:?}", event.file_path()),
                                                 Err(_) => {}
                                             }
                                         }
@@ -140,7 +141,7 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                         current_hasher = Some(blake3::Hasher::new());
                                     }
                                     Err(e) => {
-                                        eprintln!("Failed to open part file: {:?}", e);
+                                        error!("Failed to open part file: {:?}", e);
                                         current_file = None;
                                         current_hasher = None;
                                     }
@@ -149,7 +150,7 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
 
                             if let Some(file) = current_file.as_mut() {
                                 if let Err(e) = file.write_all(&chunk.data) {
-                                    eprintln!("Write error: {:?}", e);
+                                    error!("Write error: {:?}", e);
                                     current_file = None;
                                 } else {
                                     if let Some(ref pb) = active_progress {
@@ -185,13 +186,13 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                     if let Some(pb) = active_progress.take() {
                                         pb.finish_with_message(format!("✓ Received: {} ({})", chunk.rel_path.display(), duration));
                                     } else {
-                                        println!("Received: {:?} ({})", chunk.rel_path, duration);
+                                        info!("Received: {:?} ({})", chunk.rel_path, duration);
                                     }
                                 }
                             }
                         },
                         TransferMsg::Goodbye => {
-                            if verbose { println!("Peer disconnected gracefully"); }
+                            info!("Peer {} disconnected gracefully", addr);
                             break;
                         }
                     },
@@ -245,7 +246,7 @@ impl ConnectionPool {
             // self.store_stream(addr, reader.into_inner()).await;
             return Ok(());
         }
-        println!("Syncing {} missing files from {}", missing_files.len(), addr);
+        info!("Syncing {} missing files from {}", missing_files.len(), addr);
 
         let mut file_progress_bars = HashMap::new();
 
@@ -329,7 +330,7 @@ impl ConnectionPool {
                         if let Some(pb) = file_progress_bars.remove(&rel_path_str) {
                             pb.finish_with_message(format!("✓ Synced"));
                         } else {
-                            println!("Synced: {:?}", chunk.rel_path);
+                            info!("Synced: {:?}", chunk.rel_path);
                         }
                         files_remaining -= 1;
                     }
@@ -371,9 +372,9 @@ impl ConnectionPool {
 
             // let reunited_stream = reader.reunite(writer).unwrap();
             // stream = reunited_stream;
-            if self.progress_manager.is_none() {
-                println!("Sent: {:?}", event.file_path());
-            }
+            // if self.progress_manager.is_none() {
+            //     println!("Sent: {:?}", event.file_path());
+            // }
         }
         // self.store_stream(addr, stream).await;
         Ok(())
@@ -457,6 +458,20 @@ async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, roo
             pb.set_length(file_size);
         }
 
+        if file_size == 0 {
+            let chunk = FileChunk {
+                rel_path: rel_path.clone(),
+                offset: 0,
+                data: vec![],
+                is_last: true,
+            };
+            send_msg(writer, &TransferMsg::Chunk(chunk)).await?;
+            if let Some(pb) = progress {
+                pb.finish_with_message("✓ Sent".to_string());
+            }
+            return Ok(());
+        }
+
         let mut buffer = vec![0u8; CHUNK_SIZE];
         let mut total_sent = 0u64;
 
@@ -464,11 +479,14 @@ async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, roo
             let bytes_read = file.read(&mut buffer)?;
             if bytes_read == 0 { break; }
 
+            total_sent += bytes_read as u64;
+            let is_last = total_sent >= file_size;
+
             let chunk = FileChunk {
                 rel_path: rel_path.clone(),
                 offset: total_sent,
                 data: buffer[..bytes_read].to_vec(),
-                is_last: bytes_read < CHUNK_SIZE,
+                is_last,
             };
             let chunk_msg = TransferMsg::Chunk(chunk);
             send_msg(writer, &chunk_msg).await?;
@@ -480,7 +498,7 @@ async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, roo
             }
         }
         if let Some(pb) = progress {
-            pb.finish_with_message(format!("✓ Sent"));
+            pb.finish_with_message("✓ Sent".to_string());
         }
     }
     Ok(())
