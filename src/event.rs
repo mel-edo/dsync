@@ -45,4 +45,5 @@ pub struct FileChunk {
     pub offset: u64,
     pub data: Vec<u8>,
     pub is_last: bool,
+    pub compressed: bool,
 }

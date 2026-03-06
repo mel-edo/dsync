@@ -8,6 +8,7 @@ use crate::{protocol::{HandshakeMsg, TransferMsg}, util, sync};
 use blake3;
 use crate::progress::ProgressManager;
 use tracing::{debug, error, info, warn};
+use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 
@@ -148,9 +149,21 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                 }
                             }
 
+                            let data = if chunk.compressed {
+                                match decompress_size_prepended(&chunk.data) {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        error!("Decompression failed for {}: {:?}", rel_path_str, e);
+                                        current_file = None;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                chunk.data.clone()
+                            };
                             if let Some(file) = current_file.as_mut() {
-                                if let Err(e) = file.write_all(&chunk.data) {
-                                    error!("Write error: {:?}", e);
+                                if let Err(e) = file.write_all(&data) {
+                                    error!("Write error for {}: {:?}", rel_path_str, e);
                                     current_file = None;
                                 } else {
                                     if let Some(ref pb) = active_progress {
@@ -158,12 +171,12 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                                             .file_name()
                                             .and_then(|n| n.to_str())
                                             .unwrap_or("unknown");
-                                        pb.set_message(format!("Receiving: {}: {} bytes", file_name, chunk.offset + chunk.data.len() as u64));
+                                        pb.set_message(format!("Receiving {}: {} bytes", file_name, chunk.offset + data.len() as u64));
                                     }
                                 }
                             }
                             if let Some(hasher) = current_hasher.as_mut() {
-                                hasher.update(&chunk.data);
+                                hasher.update(&data);
                             }
 
                             if chunk.is_last {
@@ -304,11 +317,18 @@ impl ConnectionPool {
                         current_hasher = Some(blake3::Hasher::new());
                     }
 
+                    let data = if chunk.compressed {
+                        decompress_size_prepended(&chunk.data)
+                            .map_err(|e| anyhow::anyhow!("Decompression failed: {:?}", e))?
+                    } else {
+                        chunk.data.clone()
+                    };
+
                     if let Some(file) = current_file.as_mut() {
-                        file.write_all(&chunk.data)?;
+                        file.write_all(&data)?;
                     }
                     if let Some(hasher) = current_hasher.as_mut() {
-                        hasher.update(&chunk.data);
+                        hasher.update(&data);
                     }
 
                     if let Some(pb) = file_progress_bars.get(&rel_path_str) {
@@ -464,6 +484,7 @@ async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, roo
                 offset: 0,
                 data: vec![],
                 is_last: true,
+                compressed: false,
             };
             send_msg(writer, &TransferMsg::Chunk(chunk)).await?;
             if let Some(pb) = progress {
@@ -482,11 +503,24 @@ async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, roo
             total_sent += bytes_read as u64;
             let is_last = total_sent >= file_size;
 
+            let raw_data = &buffer[..bytes_read];
+            let (data, compressed) = if should_compress(rel_path) {
+                let c = compress_prepend_size(raw_data);
+                if c.len() < raw_data.len() {
+                    (c, true)
+                } else {
+                    (raw_data.to_vec(), false)
+                }
+            } else {
+                (raw_data.to_vec(), false)
+            };
+
             let chunk = FileChunk {
                 rel_path: rel_path.clone(),
-                offset: total_sent,
-                data: buffer[..bytes_read].to_vec(),
+                offset: total_sent - bytes_read as u64,
+                data,
                 is_last,
+                compressed,
             };
             let chunk_msg = TransferMsg::Chunk(chunk);
             send_msg(writer, &chunk_msg).await?;
@@ -546,4 +580,18 @@ pub async fn perform_server_handshake(stream: &mut TcpStream) -> anyhow::Result<
     stream.write_all(&(rej.len() as u32).to_be_bytes()).await?;
     stream.write_all(&rej).await?;
     bail!("Invalid Handshake Signature")
+}
+
+fn should_compress(path: &PathBuf) -> bool {
+    const INCOMPRESSIBLE: &[&str] = &[
+        "jpg", "jpeg", "png", "gif", "webp", "avif",
+        "mp4", "mkv", "mov", "avi", "webm",
+        "mp3", "aac", "flac", "ogg",
+        "zip", "gz", "xz", "zst", "bz2", "7z", "rar",
+        "pdf",
+    ];
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => !INCOMPRESSIBLE.contains(&ext.to_lowercase().as_str()),
+        None => true,
+    }
 }
