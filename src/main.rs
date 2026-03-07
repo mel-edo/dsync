@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use clap::Parser;
 use blake3::Hash;
-use tokio::{sync::{mpsc, Mutex}, io::AsyncReadExt, signal};
+use tokio::{sync::{mpsc, Mutex, Semaphore}, io::AsyncReadExt, signal};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use tracing::{debug, error, info, warn};
@@ -30,6 +30,7 @@ struct Config {
     peer: Option<String>,
     name: Option<String>,
     no_discovery: Option<bool>,
+    max_concurrent_transfers: Option<usize>,
 }
 
 fn load_config() -> Config {
@@ -126,6 +127,9 @@ async fn main() -> anyhow::Result<()> {
     let last_hashes: Arc<Mutex<HashMap<PathBuf, Hash>>> = Arc::new(Mutex::new(HashMap::<PathBuf, Hash>::new()));
     let connection_pool = Arc::new(ConnectionPool::new(keypair, Arc::clone(&ignore_list)));
 
+    let max_transfers = config.max_concurrent_transfers.unwrap_or(4);
+    let transfer_semaphore = Arc::new(Semaphore::new(max_transfers));
+
     let initial_sync_complete = Arc::new(Mutex::new(false));
     // setup mdns discovery
     let peer_discovery = if !no_discovery {
@@ -187,6 +191,7 @@ async fn main() -> anyhow::Result<()> {
         let last_hashes = Arc::clone(&last_hashes);
         let instance_id = instance_id.clone();
         let initial_sync_complete = Arc::clone(&initial_sync_complete);
+        let semaphore = Arc::clone(&transfer_semaphore);
 
         tokio::spawn(async move {
             while let Some(mut event) = rx.recv().await {
@@ -283,11 +288,19 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 for peer in peers {
-                    if let Err(e) = connection_pool.send_event(&peer, &event, &folder_path).await {
-                        warn!("Failed to send event to {}: {:?}", peer, e);
+                    let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+                    let pool = Arc::clone(&connection_pool);
+                    let event_clone = event.clone();
+                    let folder_clone = folder_path.clone();
+
+                    tokio::spawn(async move {
+                        let _permit = permit;  // dropped when task finishes, releasing the slot
+                        if let Err(e) = pool.send_event(&peer, &event_clone, &folder_clone).await {
+                            warn!("Failed to send event to {}: {:?}", peer, e);
                         }
-                    }
+                    });
                 }
+            }
         });
     }
     tokio::select! {
