@@ -1,7 +1,10 @@
 use std::{fs, path::Path, time::UNIX_EPOCH};
 use tracing::debug;
 use walkdir::WalkDir;
-use crate::{ignore::IgnoreList, protocol::FileInfo};
+use crate::{
+    sync::ignore::IgnoreList,
+    core::protocol::FileInfo
+};
 
 // scan the folder and return a list of all files with their hashes
 pub fn generate_local_index(root: &Path, ignore: &IgnoreList) -> Vec<FileInfo> {
@@ -30,11 +33,8 @@ pub fn generate_local_index(root: &Path, ignore: &IgnoreList) -> Vec<FileInfo> {
                         .unwrap_or_default()
                         .as_secs();
                     
-                    let hash = "CHECK_METADATA".to_string();
-
                     index.push(FileInfo {
                         path: rel_path_str,
-                        hash,
                         size,
                         modified,
                     });

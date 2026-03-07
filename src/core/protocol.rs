@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use crate::event::{FileChunk, FileEvent};
+use crate::core::event::{FileChunk, FileEvent};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum HandshakeMsg {
@@ -27,7 +27,6 @@ pub enum TransferMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInfo {
     pub path: String,
-    pub hash: String,
     pub size: u64,
     pub modified: u64,
 }

@@ -5,23 +5,16 @@ use tokio::{sync::{mpsc, Mutex, Semaphore}, io::AsyncReadExt, signal};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use tracing::{debug, error, info, warn};
-use ignore::IgnoreList;
 
 use crate::{
-    event::EventOp,
-    network::ConnectionPool,
-    watcher::watch_folder,
+    core::event::EventOp, network::{ConnectionPool, progress::ProgressManager}, sync::{ignore::IgnoreList, watcher::watch_folder}
 };
 
-mod progress;
-mod event;
+mod core;
 mod network;
 mod sync;
-mod util;
-mod watcher;
 mod discovery;
-mod ignore;
-pub mod protocol;
+mod util;
 
 #[derive(Debug, serde::Deserialize, Default)]
 struct Config {
@@ -146,8 +139,9 @@ async fn main() -> anyhow::Result<()> {
         let tx_clone = tx.clone();
         let folder_clone = folder_path.clone();
         let instance_id_clone = instance_id.clone();
+        let progress = Arc::new(ProgressManager::new());
         async move {
-            if let Err(e) = network::start_server(port, folder_clone, tx_clone, instance_id_clone, Arc::clone(&ignore_list)).await {
+            if let Err(e) = network::start_server(port, folder_clone, tx_clone, instance_id_clone, Arc::clone(&ignore_list), Arc::clone(&progress)).await {
                 error!("Server error: {:?}", e);
             }
         }

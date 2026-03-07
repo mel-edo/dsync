@@ -3,8 +3,11 @@ use pathdiff::diff_paths;
 use tokio::{fs::File, sync::{mpsc, Mutex}, io::AsyncReadExt};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::debug;
-use crate::{event::{EventOp, FileEvent}, ignore::IgnoreList};
 use blake3::Hasher;
+use crate::{
+    core::event::{EventOp, FileEvent},
+    sync::ignore::IgnoreList,
+};
 
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
 
