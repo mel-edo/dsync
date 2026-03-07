@@ -10,6 +10,8 @@ pub enum HandshakeMsg {
     },
     Ack,
     Reject,
+    EphemeralKey([u8; 32]),
+    EphemeralKeyAck([u8; 32]),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

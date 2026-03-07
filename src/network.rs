@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, io::{Read, Write}, path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashMap, fs, io::{Read, Write}, path::PathBuf, sync::Arc, time::Instant, net::IpAddr};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::{TcpListener, TcpStream}, sync::mpsc, time::{timeout, Duration}};
 use anyhow::{Context, bail};
 use crate::{event::{EventOp, FileChunk, FileEvent}, ignore::IgnoreList};
@@ -9,12 +9,18 @@ use blake3;
 use crate::progress::ProgressManager;
 use tracing::{debug, error, info, warn};
 use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
+use governor::{Quota, RateLimiter};
+use nonzero_ext::nonzero;
+use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::{Aead, AeadCore, OsRng as AeadOsRng}};
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 
 pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEvent>, instance_id: String, ignore: Arc<IgnoreList>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     info!("Server listening on port {}", port);
+
+    let limiter: Arc<RateLimiter<IpAddr, _, _>> = Arc::new(RateLimiter::dashmap(Quota::per_minute(nonzero!(10u32))));
 
     loop {
         let (mut stream, addr) = listener.accept().await?;
@@ -26,11 +32,23 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
         let instance_id_clone = instance_id.clone();
         let ignore_clone = Arc::clone(&ignore);
 
+        let ip = addr.ip();
+        if limiter.check_key(&ip).is_err() {
+            warn!("Rate limit exceeded from {}, dropping connection", ip);
+            continue;
+        }
+
         tokio::spawn(async move {
-            if let Err(e) = perform_server_handshake(&mut stream).await {
-                warn!("Handshake failed: {:?}", e);
-                return;
-            }
+            let cipher = match perform_server_handshake(&mut stream).await {
+                Ok((peer_id, cipher)) => {
+                    info!("[Trust Established] Verified peer {}", &peer_id[..16]);
+                    cipher
+                },
+                Err(e) => {
+                    warn!("Handshake failed: {:?}", e);
+                    return;
+                }
+            };
 
             // split stream into read/write halves for bidirectional communication
             let (reader, mut writer) = stream.into_split();
@@ -52,14 +70,14 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                 let mut buffer = vec![0u8; msg_len];
                 if let Err(_) = buf_reader.read_exact(&mut buffer).await { break; }
 
-                match bincode::deserialize::<TransferMsg>(&buffer) {
+                match decrypt_msg(&cipher, &buffer) {
                     
                     // peer wants our file list
                     Ok(msg) => match msg {
                         TransferMsg::IndexRequest => {
                             debug!("Received Index Request");
                             let index = sync::generate_local_index(&root_clone, &ignore_clone);
-                            send_msg(&mut writer, &TransferMsg::IndexResponse(index)).await.ok();
+                            send_encrypted(&mut writer, &cipher, &TransferMsg::IndexResponse(index)).await.ok();
                         },
 
                         // peer sent us their list
@@ -70,7 +88,7 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
 
                             for path in missing {
                                 debug!("Requesting: {}", path);
-                                send_msg(&mut writer, &TransferMsg::RequestFile(path)).await.ok();
+                                send_encrypted(&mut writer, &cipher, &TransferMsg::RequestFile(path)).await.ok();
                             }
                         },
 
@@ -81,10 +99,10 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
 
                             // send metadata first
                             let event = FileEvent::new(EventOp::Create, file_path.clone(), None);
-                            send_msg(&mut writer, &TransferMsg::Event(event)).await.ok();
+                            send_encrypted(&mut writer, &cipher, &TransferMsg::Event(event)).await.ok();
 
                             // stream the file content using helper
-                            if let Err(e) = stream_file_to_writer(&mut writer, &root_clone, &file_path, None).await {
+                            if let Err(e) = stream_file_to_writer(&mut writer, &root_clone, &file_path, None, &cipher).await {
                                 error!("Failed to stream file {}: {:?}", path, e);
                             }
                         },
@@ -210,7 +228,10 @@ pub async fn start_server(port: u16, root: PathBuf, sender: mpsc::Sender<FileEve
                             break;
                         }
                     },
-                    Err(_) => break,
+                    Err(e) => {
+                        warn!("Failed to decrypt message: {:?}", e);
+                        break;
+                    }
                 }
             }
         });
@@ -235,22 +256,20 @@ impl ConnectionPool {
     }
 
     pub async fn request_index(&self, addr: &str, root:PathBuf, tx: mpsc::Sender<FileEvent>) -> anyhow::Result<()> {
-        let mut stream = self.acquire_stream(addr).await?;
+        let (stream, cipher) = self.acquire_stream(addr).await?;
 
-        let msg = TransferMsg::IndexRequest;
-        let serialized = bincode::serialize(&msg)?;
-        stream.write_all(&(serialized.len() as u32).to_be_bytes()).await?;
-        stream.write_all(&serialized).await?;
+        let (reader_half, mut writer_half) = stream.into_split();
+        let mut reader = BufReader::new(reader_half);
 
-        let mut reader = BufReader::new(stream);
+        send_encrypted(&mut writer_half, &cipher, &TransferMsg::IndexRequest).await?;
+
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf).await?;
         let msg_len = u32::from_be_bytes(len_buf) as usize;
-
         let mut buffer = vec![0u8; msg_len];
         reader.read_exact(&mut buffer).await?;
 
-        let remote_index = match bincode::deserialize::<TransferMsg>(&buffer)? {
+        let remote_index = match decrypt_msg(&cipher, &buffer)? {
             TransferMsg::IndexResponse(idx) => idx,
             _ => bail!("Expected IndexResponse"),
         };
@@ -279,13 +298,8 @@ impl ConnectionPool {
             }
         }
 
-        let mut stream = reader.into_inner();
-
         for path in &missing_files {
-            let req = TransferMsg::RequestFile(path.clone());
-            let ser_req = bincode::serialize(&req)?;
-            stream.write_all(&(ser_req.len() as u32).to_be_bytes()).await?;
-            stream.write_all(&ser_req).await?;
+            send_encrypted(&mut writer_half, &cipher, &TransferMsg::RequestFile(path.clone())).await?;
         }
 
         let mut files_remaining = missing_files.len();
@@ -295,12 +309,12 @@ impl ConnectionPool {
 
         while files_remaining > 0 {
             let mut len_buf = [0u8; 4];
-            if let Err(_) = stream.read_exact(&mut len_buf).await { break; }
+            if let Err(_) = reader.read_exact(&mut len_buf).await { break; }
             let len = u32::from_be_bytes(len_buf) as usize;
             let mut event_buf = vec![0u8; len];
-            stream.read_exact(&mut event_buf).await?;
+            reader.read_exact(&mut event_buf).await?;
 
-            match bincode::deserialize::<TransferMsg>(&event_buf)? {
+            match decrypt_msg(&cipher, &event_buf)? {
                 TransferMsg::Event(e) => {
                     if matches!(e.operation(), EventOp::Create | EventOp::Modify) {
                         let full = root.join(e.file_path());
@@ -366,16 +380,12 @@ impl ConnectionPool {
     }
 
     pub async fn send_event(&self, addr: &str, event: &FileEvent, root_path: &PathBuf) -> anyhow::Result<()> {
-        let mut stream = self.acquire_stream(addr).await?;
+        let (stream, cipher) = self.acquire_stream(addr).await?;
+        let (_reader, mut writer) = stream.into_split();
 
-        let event_msg = TransferMsg::Event(event.clone());
-        let serialized = bincode::serialize(&event_msg)?;
-        stream.write_all(&(serialized.len() as u32).to_be_bytes()).await?;
-        stream.write_all(&serialized).await?;
+        send_encrypted(&mut writer, &cipher, &TransferMsg::Event(event.clone())).await?;
 
         if matches!(event.operation(), EventOp::Create | EventOp::Modify) {
-            let (_reader, mut writer) = stream.into_split();
-
             let progress = if let Some(ref pm) = self.progress_manager {
                 let full_path = root_path.join(event.file_path());
                 if let Ok(metadata) = std::fs::metadata(&full_path) {
@@ -391,7 +401,7 @@ impl ConnectionPool {
                 None
             };
 
-            stream_file_to_writer(&mut writer, root_path, event.file_path(), progress).await?;
+            stream_file_to_writer(&mut writer, root_path, event.file_path(), progress, &cipher).await?;
 
             // let reunited_stream = reader.reunite(writer).unwrap();
             // stream = reunited_stream;
@@ -403,7 +413,7 @@ impl ConnectionPool {
         Ok(())
     }
 
-    async fn acquire_stream(&self, addr: &str) -> anyhow::Result<TcpStream> {
+    async fn acquire_stream(&self, addr: &str) -> anyhow::Result<(TcpStream, ChaCha20Poly1305)> {
         // if let Some(stream) = {
         //     let mut guard = self.streams.lock().await;
         //     guard.remove(addr)
@@ -448,7 +458,30 @@ impl ConnectionPool {
 
             let ack_msg: HandshakeMsg = bincode::deserialize(&ack_buf)?;
             if matches!(ack_msg, HandshakeMsg::Ack) {
-                return Ok(stream);
+                let client_secret = EphemeralSecret::random_from_rng(OsRng);
+                let client_public = X25519PublicKey::from(&client_secret);
+
+                // receive server's X25519 public key
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).await?;
+                let mut buf = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+                stream.read_exact(&mut buf).await?;
+
+                let server_key_msg: HandshakeMsg = bincode::deserialize(&buf)?;
+                if let HandshakeMsg::EphemeralKey(server_key_bytes) = server_key_msg {
+                    // send our key back
+                    let ack = HandshakeMsg::EphemeralKeyAck(client_public.to_bytes());
+                    let serialized = bincode::serialize(&ack)?;
+                    stream.write_all(&(serialized.len() as u32).to_be_bytes()).await?;
+                    stream.write_all(&serialized).await?;
+
+                    let shared_secret = client_secret.diffie_hellman(&X25519PublicKey::from(server_key_bytes));
+                    let cipher = ChaCha20Poly1305::new_from_slice(shared_secret.as_bytes())
+                        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {:?}", e))?;
+
+
+                    return Ok((stream, cipher));
+                }
             }
         }
         bail!("Handshake failed with {}", addr)
@@ -462,16 +495,8 @@ impl ConnectionPool {
 
 // helpers
 
-// helper to send any TransferMsg
-async fn send_msg(writer: &mut tokio::net::tcp::OwnedWriteHalf, msg: &TransferMsg) -> anyhow::Result<()> {
-    let serialized = bincode::serialize(msg)?;
-    writer.write_all(&(serialized.len() as u32).to_be_bytes()).await?;
-    writer.write_all(&serialized).await?;
-    Ok(())
-}
-
 // helper to chunk and stream a file
-async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, root: &PathBuf, rel_path: &PathBuf, progress: Option<indicatif::ProgressBar>) -> anyhow::Result<()> {
+async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, root: &PathBuf, rel_path: &PathBuf, progress: Option<indicatif::ProgressBar>, cipher: &ChaCha20Poly1305) -> anyhow::Result<()> {
     let full_path = root.join(rel_path);
 
     if let Ok(mut file) = fs::File::open(&full_path) {
@@ -489,7 +514,7 @@ async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, roo
                 is_last: true,
                 compressed: false,
             };
-            send_msg(writer, &TransferMsg::Chunk(chunk)).await?;
+            send_encrypted(writer, cipher, &TransferMsg::Chunk(chunk)).await?;
             if let Some(pb) = progress {
                 pb.finish_with_message("✓ Sent".to_string());
             }
@@ -526,7 +551,7 @@ async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, roo
                 compressed,
             };
             let chunk_msg = TransferMsg::Chunk(chunk);
-            send_msg(writer, &chunk_msg).await?;
+            send_encrypted(writer, cipher, &chunk_msg).await?;
 
             if let Some(ref pb) = progress {
                 pb.set_position(total_sent);
@@ -539,7 +564,7 @@ async fn stream_file_to_writer(writer: &mut tokio::net::tcp::OwnedWriteHalf, roo
     Ok(())
 }
 
-pub async fn perform_server_handshake(stream: &mut TcpStream) -> anyhow::Result<String> {
+pub async fn perform_server_handshake(stream: &mut TcpStream) -> anyhow::Result<(String, ChaCha20Poly1305)> {
     // generate a random challenge
     let mut challenge = [0u8; 32];
     OsRng.fill_bytes(&mut challenge);
@@ -572,7 +597,31 @@ pub async fn perform_server_handshake(stream: &mut TcpStream) -> anyhow::Result<
             stream.write_all(&(ack.len() as u32).to_be_bytes()).await?;
             stream.write_all(&ack).await?;
 
-            return Ok(hex::encode(public_key));  // return their ID
+            let server_secret = EphemeralSecret::random_from_rng(OsRng);
+            let server_public = X25519PublicKey::from(&server_secret);
+
+            // send our X25519 public key
+            let key_msg = HandshakeMsg::EphemeralKey(server_public.to_bytes());
+            let serialized = bincode::serialize(&key_msg)?;
+            stream.write_all(&(serialized.len() as u32).to_be_bytes()).await?;
+            stream.write_all(&serialized).await?;
+
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let mut buf = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+            stream.read_exact(&mut buf).await?;
+
+            let peer_key_msg: HandshakeMsg = bincode::deserialize(&buf)?;
+            let cipher = if let HandshakeMsg::EphemeralKeyAck(peer_key_bytes) = peer_key_msg {
+                let peer_public = X25519PublicKey::from(peer_key_bytes);
+                let shared_secret = server_secret.diffie_hellman(&peer_public);
+                ChaCha20Poly1305::new_from_slice(shared_secret.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("Failed to create cipher: {:?}", e))?
+            } else {
+                bail!("Expected EphemeralKeyAck");
+            };
+
+            return Ok((hex::encode(public_key), cipher));  // return their ID
         }
     }
 
@@ -595,4 +644,33 @@ fn should_compress(path: &PathBuf) -> bool {
         Some(ext) => !INCOMPRESSIBLE.contains(&ext.to_lowercase().as_str()),
         None => true,
     }
+}
+
+fn encrypt_msg(cipher: &ChaCha20Poly1305, msg: &TransferMsg) -> anyhow::Result<Vec<u8>> {
+    let plaintext = bincode::serialize(msg)?;
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut AeadOsRng);
+    let ciphertext = cipher.encrypt(&nonce, plaintext.as_ref())
+        .map_err(|e| anyhow::anyhow!("Encryption failed: {:?}", e))?;
+    // prepend nonce to ciphertext so receiver can use it
+    let mut result = nonce.to_vec();
+    result.extend(ciphertext);
+    Ok(result)
+}
+
+fn decrypt_msg(cipher: &ChaCha20Poly1305, data: &[u8]) -> anyhow::Result<TransferMsg> {
+    if data.len() < 12 {
+        bail!("Message too short to contain nonce");
+    }
+    let (nonce_bytes, ciphertext) = data.split_at(12);
+    let nonce = chacha20poly1305::Nonce::from_slice(nonce_bytes);
+    let plaintext = cipher.decrypt(nonce, ciphertext)
+        .map_err(|e| anyhow::anyhow!("Decryption failed: {:?}", e))?;
+    Ok(bincode::deserialize(&plaintext)?)
+}
+
+async fn send_encrypted(writer: &mut tokio::net::tcp::OwnedWriteHalf, cipher: &ChaCha20Poly1305, msg: &TransferMsg) -> anyhow::Result<()> {
+    let encrypted = encrypt_msg(cipher, msg)?;
+    writer.write_all(&(encrypted.len() as u32).to_be_bytes()).await?;
+    writer.write_all(&encrypted).await?;
+    Ok(())
 }
