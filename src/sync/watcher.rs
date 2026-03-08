@@ -47,7 +47,7 @@ pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>, ignore
                     let should_process = {
                         let mut map = debounce.lock().await;
                         if let Some(&last_time) = map.get(&path) {
-                            if last_time.elapsed() < std::time::Duration::from_secs(2) {
+                            if last_time.elapsed() < std::time::Duration::from_secs(10) {
                                 false
                             } else {
                                 map.insert(path.clone(), Instant::now());

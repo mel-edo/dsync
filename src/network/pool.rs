@@ -164,30 +164,40 @@ impl ConnectionPool {
     }
 
     pub async fn send_event(&self, addr: &str, event: &FileEvent, root_path: &PathBuf) -> anyhow::Result<()> {
-
         let mut conn = self.checkout(addr).await?;
-        send_encrypted(&mut conn.writer, &conn.cipher, &TransferMsg::Event(event.clone())).await?;
 
+        let result = send_encrypted(&mut conn.writer, &conn.cipher, &TransferMsg::Event(event.clone())).await;
+
+        let mut conn = if result.is_err() {
+            // connection was stale, don't return it to pool, retry once
+            debug!("Stale connection to {}, reconnecting", addr);
+            let mut fresh = self.checkout(addr).await?;
+            send_encrypted(&mut fresh.writer, &fresh.cipher, &TransferMsg::Event(event.clone())).await?;
+            fresh
+        } else {
+            conn
+        };
+            
         if matches!(event.operation(), EventOp::Create | EventOp::Modify) {
             let progress = if let Some(ref pm) = self.progress_manager {
                 let full_path = root_path.join(event.file_path());
                 if let Ok(metadata) = std::fs::metadata(&full_path) {
                     let file_size = metadata.len();
                     let file_name = event.file_path().file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown");
-                    Some(pm.create_transfer_progress(file_name, file_size))
-                } else {
-                    None
-                }
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
+                Some(pm.create_transfer_progress(file_name, file_size))
+            } else {
+                None
+            }
             } else {
                 None
             };
-
+        
             stream_file_to_writer(&mut conn.writer, root_path, event.file_path(), progress, &conn.cipher).await?;
-        }
+        }   
         self.checkin(addr, conn).await;
-        Ok(())
+        return Ok(());
     }
 
     async fn connect_and_handshake(&self, addr: &str) -> anyhow::Result<(TcpStream, ChaCha20Poly1305)> {

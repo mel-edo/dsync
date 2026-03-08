@@ -5,6 +5,7 @@ use tokio::{sync::{mpsc, Mutex, Semaphore}, io::AsyncReadExt, signal};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use tracing::{debug, error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 use crate::{
     core::event::EventOp, network::{ConnectionPool, progress::ProgressManager}, sync::{ignore::IgnoreList, watcher::watch_folder}
@@ -89,14 +90,16 @@ async fn main() -> anyhow::Result<()> {
     let name = if args.name != "dsync-instance" { args.name } else { config.name.unwrap_or(args.name) };
     let no_discovery = args.no_discovery || config.no_discovery.unwrap_or(false);
 
-    let log_level = if args.verbose {
-        tracing::Level::DEBUG
+    let filter = if args.verbose {
+        EnvFilter::new("debug,mdns_sd=warn")
     } else {
-        tracing::Level::INFO
+        EnvFilter::new("info")
     };
+
     tracing_subscriber::fmt()
-        .with_max_level(log_level)
+        .with_env_filter(filter)
         .with_target(false)
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new("%H:%M:%S".to_string()))
         .init();
 
     // generate ephemeral identity

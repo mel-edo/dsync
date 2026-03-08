@@ -1,5 +1,5 @@
-use std::{collections::HashMap, fs, io::Write, path::PathBuf, sync::Arc, time::Instant, net::IpAddr};
-use tokio::{io::{AsyncReadExt, BufReader}, net::TcpListener, sync::mpsc};
+use std::{collections::HashMap, fs, io::Write, net::IpAddr, path::PathBuf, sync::Arc, time::Instant};
+use tokio::{io::{AsyncReadExt, BufReader}, net::TcpListener, sync::mpsc, time::Duration};
 use governor::{Quota, RateLimiter};
 use nonzero_ext::nonzero;
 use tracing::{debug, info, warn, error};
@@ -28,7 +28,7 @@ pub async fn start_server(
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     info!("Server listening on port {}", port);
 
-    let limiter: Arc<RateLimiter<IpAddr, _, _>> = Arc::new(RateLimiter::dashmap(Quota::per_minute(nonzero!(10u32))));
+    let limiter: Arc<RateLimiter<IpAddr, _, _>> = Arc::new(RateLimiter::dashmap(Quota::per_minute(nonzero!(50u32))));
 
     loop {
         let (mut stream, addr) = listener.accept().await?;
@@ -72,7 +72,18 @@ pub async fn start_server(
 
             loop {
                 let mut len_buf = [0u8; 4];
-                if let Err(_) = buf_reader.read_exact(&mut len_buf).await { break; }
+                match tokio::time::timeout(
+                    Duration::from_secs(300),
+                    buf_reader.read_exact(&mut len_buf)
+                ).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        warn!("Connection timed out from {}", addr);
+                        break;
+                    }
+                }
+
                 let msg_len = u32::from_be_bytes(len_buf) as usize;
 
                 let mut buffer = vec![0u8; msg_len];
@@ -196,7 +207,7 @@ pub async fn start_server(
                                             .file_name()
                                             .and_then(|n| n.to_str())
                                             .unwrap_or("unknown");
-                                        pb.set_message(format!("Receiving {}: {} bytes", file_name, chunk.offset + data.len() as u64));
+                                        pb.set_message(format!("Receiving {} ({:.1} MB)", file_name, (chunk.offset + data.len() as u64) as f64 / 1_048_576.0));
                                     }
                                 }
                             }
