@@ -2,12 +2,16 @@ use std::{collections::HashMap, path::{PathBuf, Path}, sync::Arc, time::Instant}
 use pathdiff::diff_paths;
 use tokio::{fs::File, sync::{mpsc, Mutex}, io::AsyncReadExt};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use crate::event::{FileEvent, EventOp};
+use tracing::debug;
 use blake3::Hasher;
+use crate::{
+    core::event::{EventOp, FileEvent},
+    sync::ignore::IgnoreList,
+};
 
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
 
-pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> notify::Result<RecommendedWatcher> {
+pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>, ignore: Arc<IgnoreList>) -> notify::Result<RecommendedWatcher> {
     let root = root.canonicalize().unwrap_or(root);
     let debounce_map: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let handle = tokio::runtime::Handle::current();
@@ -15,6 +19,7 @@ pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
     let root_clone = root.clone();
     let sender_clone = sender.clone();
     let debounce_clone = debounce_map.clone();
+    let ignore_clone = Arc::clone(&ignore);
 
     let mut file_watcher = RecommendedWatcher::new(
         move |res: notify::Result<Event>| {
@@ -22,6 +27,7 @@ pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
             let tx = sender_clone.clone();
             let debounce = debounce_clone.clone();
             let handle = handle.clone();
+            let ignore = ignore_clone.clone();
 
             if let Ok(event) = res {
                 if event.paths.is_empty() {
@@ -41,7 +47,7 @@ pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
                     let should_process = {
                         let mut map = debounce.lock().await;
                         if let Some(&last_time) = map.get(&path) {
-                            if last_time.elapsed() < std::time::Duration::from_secs(2) {
+                            if last_time.elapsed() < std::time::Duration::from_secs(10) {
                                 false
                             } else {
                                 map.insert(path.clone(), Instant::now());
@@ -63,6 +69,11 @@ pub async fn watch_folder(root: PathBuf, sender: mpsc::Sender<FileEvent>) -> not
                             Some(p) => p,
                             None => return,
                         };
+
+                        if ignore.is_ignored(&relative) {
+                            debug!("Ignoring watcher event for {:?}", relative);
+                            return;
+                        }
         
                         match tokio::fs::metadata(&path).await {
                             Ok(meta) => {

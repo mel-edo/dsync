@@ -1,62 +1,72 @@
 # dsync - Zero-Config P2P File Sync with Ephemeral Trust
 
-**A decentralized file synchronization tool that establishes trust automatically without pre-configuration, cloud services, or persistent credentials.**
+**A peer-to-peer file synchronization tool for local networks that requires no prior configuration or persistent credentials.**
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-orange.svg)](https://www.rust-lang.org/)
 
 ---
 
-## What Makes dsync Different?
+## Overview
 
-Most sync tools require one of:
-- **Manual setup** (Syncthing: copy device IDs, approve peers)
-- **Cloud accounts** (Dropbox, Google Drive, iCloud)
-- **Pre-shared secrets** (Resilio Sync)
-- **Certificate authorities** (Traditional TLS/SSL)
+Most file synchronization tools rely on one of the following:
 
-**dsync does none of this.**
+- Manual device pairing (e.g exchanging device IDs)
+- Cloud-based coordination
+- Pre-shared secrets or credentials
+- Certificate authorities
 
-1. Start dsync → Generates temporary cryptographic identity
-2. Automatic discovery → Finds peers via mDNS (like AirDrop)
-3. Zero-config handshake → Verifies identity via challenge-response
-4. Sync begins → No setup, no configuration, no cloud
-5. Exit dsync → Identity destroyed, trust relationships gone
+`dsync` instead uses ephemeral identities and automatic peer discovery.
+
+Typical workflow:
+
+1. Start dsync → generates a temporary cryptographic identity
+2. Peers are discovered automatically using mDNS
+3. A challenge–response handshake verifies peer identity
+4. An encrypted channel is established via X25519 key exchange
+5. File synchronization begins
+6. When dsync exits, the identity is discarded
 
 ---
 
 ## Features
 
 ### Security
-- **Ed25519 cryptographic handshake** - Challenge-response authentication
-- **Ephemeral identities** - New keys generated on each startup
-- **Zero trust by default** - No pre-configured peers, no persistent credentials
-- **Local-only** - Never touches the internet, all traffic stays on LAN
+- Ed25519 challenge–response authentication
+- X25519 ECDH key exchange per session
+- ChaCha20-Poly1305 end-to-end encryption
+- Ephemeral identities generated on each startup
+- No pre-configured peers or persistent credentials
+- Rate limiting to protect against handshake flooding
+- Designed for local networks only (no internet communication)
 
 ### Performance  
-- **Real-time sync** - File changes detected and synced instantly
-- **Chunked transfers** - Large files streamed efficiently
-- **Blake3 hashing** - Fast file integrity verification
-- **Async I/O** - Powered by Tokio for high concurrency
+- Real-time synchronization using filesystem notifications
+- Chunked file transfers for large files
+- Blake3 hashing for fast integrity verification
+- Asynchronous I/O using Tokio
+- LZ4 compression for compressible files
+- Persistent connection pool (eliminates per-transfer handshake overhead)
+- Parallel transfers with configurable concurrency
 
 ### Network
-- **Automatic peer discovery** - mDNS/Bonjour (zero manual configuration)
-- **Cross-platform** - Works on Linux, macOS, Windows
-- **Multi-peer mesh** - Sync across 2+ devices simultaneously
-- **Resilient** - Handles network interruptions gracefully
+- Automatic peer discovery using mDNS
+- Direct peer-to-peer TCP connections
+- Supports multiple peers on the same network
+- Handles temporary network interruptions
 
 ### Privacy
-- **No cloud** - Files never leave your local network
-- **No telemetry** - Zero data collection
-- **No accounts** - No registration, no tracking
-- **Decentralized** - No single point of failure or surveillance
+- No cloud services
+- No telemetry or data collection
+- No accounts or registration
+- Fully peer-to-peer architecture
 
 ---
 
 ## Installation
 
 ### Prerequisites
-- [Rust toolchain](https://rustup.rs/) (1.70+)
+- [Rust toolchain](https://rustup.rs/) (1.80+)
 
 ### Build from Source
 
@@ -78,10 +88,10 @@ cp target/release/dsync ~/.local/bin/
 
 ```bash
 # On Machine 1
-dsync -d ~/Documents -p 9000 -n laptop
+dsync -d ~/path/to/folder
 
 # On Machine 2
-dsync -d ~/Documents -p 9000 -n desktop
+dsync -d ~/path/to/folder
 
 # That's it! They'll discover each other and start syncing.
 ```
@@ -106,6 +116,7 @@ dsync -d <directory> -p <port> -n <name>
 | `-a, --peer` | Manually specify peer (format: `ip:port`) | - | No |
 | `--no-discovery` | Disable automatic mDNS discovery | false | No |
 | `-v, --verbose` | Show detailed logs | false | No |
+| `-e, --exclude` | Exclude pattern, repeatable (e.g. `*.log`) | - | No |
 
 ### Examples
 
@@ -120,12 +131,17 @@ dsync -d ~/shared -p 9000 -n machine-b
 
 **Verbose mode (see what's happening):**
 ```bash
-dsync -d ~/Documents -p 9000 -n laptop -v
+dsync -d ~/Documents -v
 ```
 
 **Disable auto-discovery (manual peer specification):**
 ```bash
 dsync -d ~/sync -p 9000 --no-discovery -a 192.168.1.100:9000
+```
+
+**Exclude patterns:**
+```bash
+dsync -d ~/code -e "*.log" -e "build/"
 ```
 
 **Multiple instances on same machine (for testing):**
@@ -141,6 +157,37 @@ dsync -d ./test_c -p 9002 -n instance-c -v
 ```
 
 ---
+
+### Configuration
+
+dsync looks for a config file at:
+
+- Linux/macOS: `~/.config/dsync/dsync.toml`
+- Windows: `%APPDATA%\dsync\dsync.toml`
+
+All values are optional and overridden by CLI arguments.
+
+```toml
+# dsync.toml
+
+# Folder to sync (can be overridden with -d)
+path = "/home/user/sync"
+
+# Port to listen on
+port = 9000
+
+# Instance name shown during discovery
+name = "dsync-instance"
+
+# Static peer to always connect to (in addition to mDNS)
+# peer = "192.168.1.100:9000"
+
+# Disable mDNS auto-discovery
+# no_discovery = false
+
+# Maximum concurrent file transfers
+max_concurrent_transfers = 4
+```
 
 ## How It Works
 
@@ -162,16 +209,17 @@ mDNS Broadcast:
 Peers discover each other automatically on LAN
 ```
 
-### 3. Trust Establishment (The Novel Part!)
+### 3. Trust Establishment
 ```
 Client → Server: [TCP Connect]
 Server → Client: Challenge (32 random bytes)
 Client → Server: {PublicKey, Signature(Challenge)}
-Server: Verify signature matches public key from mDNS
-Server → Client: [Accept/Reject]
+Server: Verify signature → Send Ack + X25519 public key
+Client → Server: X25519 public key
+Both: Derive shared secret → ChaCha20-Poly1305 encrypted channel
 
-If signature valid → Trusted connection established
-If signature invalid → Connection dropped
+If signature valid → Encrypted channel established
+If signature invalid → Connection dropped immediately
 ```
 
 ### 4. File Synchronization
@@ -184,104 +232,97 @@ Initial Sync:
 Real-time Sync:
 ├─ File watcher detects changes
 ├─ Compute Blake3 hash
-├─ Broadcast to all trusted peers
+├─ Compress with LZ4 (if compressible)
+├─ Encrypt and broadcast to all trusted peers
 └─ Peers apply changes locally
 ```
 
 ---
 
-**Components:**
-- **File Watcher** - Monitors directory for changes (using `notify` crate)
-- **mDNS Discovery** - Broadcasts/discovers peers (using `mdns-sd` crate)
-- **Connection Pool** - Manages TCP connections to peers
-- **Handshake Module** - Ephemeral trust establishment (Ed25519)
-- **Sync Engine** - Handles file transfers and conflict resolution
-
----
-
 ## File Ignore Rules
 
-Create a `.dsyncignore` file in your sync directory:
+A `.dsyncignore` file is automatically created in your sync directory on first run. Edit it to control what gets synced.
 
 ```gitignore
-# System files
-.DS_Store
-Thumbs.db
+# dsyncignore - files and patterns listed here will not be synced
+# Uses glob syntax. Lines starting with # are comments.
+# Version control
+.git
+.git/**
 
-# Build artifacts
-target/
-node_modules/
-*.o
-*.so
+# Dependencies
+node_modules
+node_modules/**
+
+# OS files
+.DS_Store
 
 # Temporary files
 *.tmp
-*.swp
-*~
-
-# Version control
-.git/
-.svn/
+*.part
 ```
 
-**Default ignores** (always applied):
-- `.git/`
-- `*.part` (partial downloads)
-- `.DS_Store`
-- `node_modules/`
+**Always ignored**:
+- `*.part` - partial downloads in progress
+- `.dsyncignore` - the ignore file itself
 
 ---
 
 ## Security Considerations
 
 ### What dsync DOES provide:
-**Authentication** - Peers prove ownership of advertised public key  
-**Integrity** - Blake3 hashing detects corruption  
-**Local trust** - Only peers on same mDNS domain can discover  
-**Ephemeral identity** - No persistent credentials to steal  
+**Authentication** - peers prove ownership of their advertised public key
+**Encryption** - all traffic is encrypted with ChaCha20-Poly1305
+**Integrity** - Blake3 hashing detects corruption and prevents duplicate transfers
+**Ephemeral identity** - no persistent credentials to steal or leak
+**Local trust** - only peers on the same mDNS domain can discover each other
+**DoS protection** - rate limiting on handshake attempts per IP 
 
-### What dsync does NOT provide (yet):
-**Encryption** - Traffic is NOT encrypted (planned feature)  
-**Authorization** - Any peer on LAN can sync (by design)  
-**Anonymity** - Hostnames/IPs are visible  
+### What dsync does Not provide:
+**Internet sync** - dsync is designed for trusted local networks only  
+**Authorization** - Any peer on LAN that completes the handshake can sync (by design)  
+**Anonymity** - Hostnames/IPs are visible on the network
 
 ### Threat Model
 
 **Protected against:**
-- Unauthorized peers (must complete handshake)
-- Replay attacks (challenge-response prevents this)
-- Identity theft (keys never saved, can't be stolen)
+- Unauthorized peers (must complete Ed25519 handshake)
+- Replay attacks (challenge-response with fresh random challenge each time)
+- Identity theft (keys are never saved to disk)
+- Passive eavesdropping (ChaCha20-Poly1305 encryption)
+- Handshake flooding (per-IP rate limiting)
 
-**NOT protected against:**
-- Network sniffing (no encryption yet)
-- Malicious peer on your LAN (assumes trusted network)
+**Not protected against:**
+- Malicious peers on the same network (dsync assumes a trusted LAN)
 - Man-in-the-middle (mDNS can be spoofed on hostile networks)
+- Physical access to a running machine (keys exist in memory while running)
 
-**Recommendation:** Use on trusted networks (home/office LAN, VPN). For hostile networks, encryption will be added in future releases.
+**Recommendation:** Use on trusted networks (home/office LAN, VPN). Do not expose port 9000 to the internet.
 
 ---
 
 ## Roadmap
 
-### Completed (v0.1)
-- [x] Ephemeral Ed25519 identity
-- [x] mDNS peer discovery
-- [x] Challenge-response handshake
-- [x] Real-time file watching
-- [x] Chunked file transfers
-- [x] Progress indicators
-- [x] Better error messages
-- [x] Graceful shutdown
+### Completed
+- Ephemeral Ed25519 identity
+- mDNS peer discovery
+- Challenge-response handshake
+- X25519 ECDH + ChaCha20-Poly1305 end-to-end encryption
+- Real-time file watching
+- Chunked file transfers
+- LZ4 compression
+- Persistent connection pool
+- Parallel transfers
+- Progress indicators
+- .dsyncignore with auto-generation
+- --exclude CLI flag
+- Rate limiting (DoS protection)
+- Config file support (dsync.toml)
+- Graceful shutdown
 
 ### In Progress
 - [ ] Multi-peer support
 - [ ] Cross-platform support
-- [ ] End-to-end encryption (ChaCha20-Poly1305)
-- [ ] `.dsyncignore` improvements
-
-### 🔮 Planned Features
-- [ ] Compression (LZ4)
-- [ ] Bandwidth throttling
 
 ---
 
@@ -306,19 +347,13 @@ dsync -d ~/sync -p 9000 -a 192.168.1.100:9000
 1. File not in `.dsyncignore`
 2. Run with `-v` to see events
 3. Check file permissions
-4. Verify disk space on receiving end
+4. Verify available disk space on receiving end
 
 ---
 
 ## Contributing
 
-Contributions welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+Suggestions, fixes and improvments are welcome. Feel free to open an issue or a PR.
 
 ---
 

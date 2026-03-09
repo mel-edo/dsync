@@ -1,0 +1,35 @@
+dsync - Zero-config P2P File Sync
+==================================
+
+WINDOWS
+-------
+1. Double-click start-dsync.bat
+2. When prompted, paste your folder path
+   (In File Explorer, click the address bar to copy the path)
+3. Run dsync on another machine on the same network
+4. Files will sync automatically
+
+LINUX
+-----
+./dsync -d /path/to/folder
+
+OPTIONS
+-------
+-d    Folder to sync (required)
+-p    Port to use (default: 9000)
+-n    Name for this instance (default: hostname)
+-v    Verbose mode (see detailed logs)
+
+TROUBLESHOOTING
+---------------
+- Both machines must be on the same network (same WiFi/LAN)
+- Windows: allow dsync through the firewall when prompted
+- Linux: Open port 9000 (e.g. sudo ufw allow 9000/tcp)
+
+- If peers don't find each other automatically, use manual mode:
+    dsync -d /path/to/folder -a 192.168.x.x:9000
+  (replace with the other machine's IP)
+
+MORE INFO
+---------
+https://github.com/mel-edo/dsync

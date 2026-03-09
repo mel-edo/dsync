@@ -17,7 +17,7 @@ impl ProgressManager {
 
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})")
+                .template("{msg} [{bar:40.cyan/blue}] {percent}% ({bytes_per_sec}, {eta})")
                 .unwrap()
                 .progress_chars("=>-")
         );
@@ -30,7 +30,7 @@ impl ProgressManager {
 
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{msg} [{bar:40.green/blue}] {bytes}/{total_bytes} ({bytes_per_sec})")
+                .template("{msg} [{bar:40.green/blue}] {percent}% ({bytes_per_sec}, {eta})")
                 .unwrap()
                 .progress_chars("=>-")
         );

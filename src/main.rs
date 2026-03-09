@@ -1,32 +1,57 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use clap::Parser;
 use blake3::Hash;
-use tokio::{sync::{mpsc, Mutex}, io::AsyncReadExt, signal};
+use tokio::{sync::{mpsc, Mutex, Semaphore}, io::AsyncReadExt, signal};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use tracing::{debug, error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 use crate::{
-    event::EventOp,
-    network::ConnectionPool,
-    watcher::watch_folder,
+    core::event::EventOp, network::{ConnectionPool, progress::ProgressManager}, sync::{ignore::IgnoreList, watcher::watch_folder}
 };
 
-mod progress;
-mod event;
+mod core;
 mod network;
 mod sync;
-mod util;
-mod watcher;
 mod discovery;
-pub mod protocol;
+mod util;
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct Config {
+    path: Option<String>,
+    port: Option<u16>,
+    peer: Option<String>,
+    name: Option<String>,
+    no_discovery: Option<bool>,
+    max_concurrent_transfers: Option<usize>,
+}
+
+fn load_config() -> Config {
+    let config_path = dirs::config_dir()
+        .map(|d| d.join("dsync").join("dsync.toml"))
+        .filter(|p| p.exists());
+
+    let config_path = match config_path {
+        Some(p) => p,
+        None => return Config::default(),
+    };
+
+    match std::fs::read_to_string(&config_path) {
+        Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
+            warn!("Failed to parse {:?}: {}", config_path, e);
+            Config::default()
+        }),
+        Err(_) => Config::default(),
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Folder path to sync
     #[arg(short = 'd', long)]
-    path: String,
+    path: Option<String>,
 
     /// Port to listen on (default: 9000)
     #[arg(short = 'p', long, default_value_t = 9000)]
@@ -47,20 +72,34 @@ struct Args {
     /// Show detailed connection logs
     #[arg(short = 'v', long, default_value_t = false)]
     verbose: bool,
+
+    /// Exclude patterns (e.g. --exclude "*.log" -- exclude "build/")
+    #[arg(short = 'e', long, num_args = 0..)]
+    exclude: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let log_level = if args.verbose {
-        tracing::Level::DEBUG
+    let config = load_config();
+
+    let path = args.path.or(config.path).expect("No sync folder specified. Use -d or set 'path' in dsync.toml");
+    let port = if args.port != 9000 { args.port } else { config.port.unwrap_or(args.port) };
+    let peer = args.peer.or(config.peer);
+    let name = if args.name != "dsync-instance" { args.name } else { config.name.unwrap_or(args.name) };
+    let no_discovery = args.no_discovery || config.no_discovery.unwrap_or(false);
+
+    let filter = if args.verbose {
+        EnvFilter::new("debug,mdns_sd=warn")
     } else {
-        tracing::Level::INFO
+        EnvFilter::new("info")
     };
+
     tracing_subscriber::fmt()
-        .with_max_level(log_level)
+        .with_env_filter(filter)
         .with_target(false)
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new("%H:%M:%S".to_string()))
         .init();
 
     // generate ephemeral identity
@@ -71,23 +110,27 @@ async fn main() -> anyhow::Result<()> {
     let my_id_hex = hex::encode(my_public_key);
     info!("Ephemeral ID: {}", &my_id_hex[..16]);
 
-    let folder_path = PathBuf::from(args.path);
-    let port = args.port;
-    let peer_addr = args.peer;
+    let folder_path = PathBuf::from(path);
+    let ignore_list = Arc::new(IgnoreList::load(&folder_path, &args.exclude));
+    let port = port;
+    let peer_addr = peer;
     let instance_id = my_id_hex.clone();
 
     let (tx, mut rx) = mpsc::channel(100);
     let (peer_tx, mut peer_rx) = mpsc::channel(100);
-    let _watcher = watch_folder(folder_path.clone(), tx.clone()).await?;
+    let _watcher = watch_folder(folder_path.clone(), tx.clone(), Arc::clone(&ignore_list)).await?;
 
     let last_hashes: Arc<Mutex<HashMap<PathBuf, Hash>>> = Arc::new(Mutex::new(HashMap::<PathBuf, Hash>::new()));
-    let connection_pool = Arc::new(ConnectionPool::new(keypair));
+    let connection_pool = Arc::new(ConnectionPool::new(keypair, Arc::clone(&ignore_list)));
+
+    let max_transfers = config.max_concurrent_transfers.unwrap_or(4);
+    let transfer_semaphore = Arc::new(Semaphore::new(max_transfers));
 
     let initial_sync_complete = Arc::new(Mutex::new(false));
     // setup mdns discovery
-    let peer_discovery = if !args.no_discovery {
+    let peer_discovery = if !no_discovery {
         let discovery = discovery::PeerDiscovery::new(my_id_hex)?;
-        discovery.register_service(port, &args.name)?;
+        discovery.register_service(port, &name)?;
         discovery.start_browsing(peer_tx).await?;
         Some(Arc::new(discovery))
     } else {
@@ -99,8 +142,9 @@ async fn main() -> anyhow::Result<()> {
         let tx_clone = tx.clone();
         let folder_clone = folder_path.clone();
         let instance_id_clone = instance_id.clone();
+        let progress = Arc::new(ProgressManager::new());
         async move {
-            if let Err(e) = network::start_server(port, folder_clone, tx_clone, instance_id_clone).await {
+            if let Err(e) = network::start_server(port, folder_clone, tx_clone, instance_id_clone, Arc::clone(&ignore_list), Arc::clone(&progress)).await {
                 error!("Server error: {:?}", e);
             }
         }
@@ -144,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
         let last_hashes = Arc::clone(&last_hashes);
         let instance_id = instance_id.clone();
         let initial_sync_complete = Arc::clone(&initial_sync_complete);
+        let semaphore = Arc::clone(&transfer_semaphore);
 
         tokio::spawn(async move {
             while let Some(mut event) = rx.recv().await {
@@ -240,11 +285,19 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 for peer in peers {
-                    if let Err(e) = connection_pool.send_event(&peer, &event, &folder_path).await {
-                        warn!("Failed to send event to {}: {:?}", peer, e);
+                    let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+                    let pool = Arc::clone(&connection_pool);
+                    let event_clone = event.clone();
+                    let folder_clone = folder_path.clone();
+
+                    tokio::spawn(async move {
+                        let _permit = permit;  // dropped when task finishes, releasing the slot
+                        if let Err(e) = pool.send_event(&peer, &event_clone, &folder_clone).await {
+                            warn!("Failed to send event to {}: {:?}", peer, e);
                         }
-                    }
+                    });
                 }
+            }
         });
     }
     tokio::select! {

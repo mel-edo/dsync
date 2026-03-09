@@ -30,7 +30,7 @@ impl FileEvent {
 
     pub fn file_path(&self) -> &PathBuf { &self.file_path }
     pub fn operation(&self) -> &EventOp { &self.operation }
-    pub fn timestamp(&self) -> &SystemTime { &self.timestamp }
+    // pub fn timestamp(&self) -> &SystemTime { &self.timestamp }
     
     pub fn with_origin(mut self, origin_id: String) -> Self {
         self.origin_id = Some(origin_id);

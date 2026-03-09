@@ -1,10 +1,13 @@
 use std::{fs, path::Path, time::UNIX_EPOCH};
 use tracing::debug;
 use walkdir::WalkDir;
-use crate::protocol::FileInfo;
+use crate::{
+    sync::ignore::IgnoreList,
+    core::protocol::FileInfo
+};
 
 // scan the folder and return a list of all files with their hashes
-pub fn generate_local_index(root: &Path) -> Vec<FileInfo> {
+pub fn generate_local_index(root: &Path, ignore: &IgnoreList) -> Vec<FileInfo> {
     let mut index = Vec::new();
 
     for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
@@ -18,6 +21,10 @@ pub fn generate_local_index(root: &Path) -> Vec<FileInfo> {
             if let Ok(rel_path) = path.strip_prefix(root) {
                 let rel_path_str = rel_path.to_string_lossy().replace("\\", "/");
 
+                if ignore.is_ignored(rel_path) {
+                    continue;
+                }
+
                 if let Ok(metadata) = fs::metadata(path) {
                     let size = metadata.len();
                     let modified = metadata.modified()
@@ -26,11 +33,8 @@ pub fn generate_local_index(root: &Path) -> Vec<FileInfo> {
                         .unwrap_or_default()
                         .as_secs();
                     
-                    let hash = "CHECK_METADATA".to_string();
-
                     index.push(FileInfo {
                         path: rel_path_str,
-                        hash,
                         size,
                         modified,
                     });
